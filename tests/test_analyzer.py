@@ -200,6 +200,120 @@ def test_analyze_video_uses_next_valid_frame_in_same_sample_slot(tmp_path):
     assert [event.timestamp for event in events] == ["00:00:00"]
 
 
+class LatePersonDetector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def detect(self, frame) -> list[PersonDetection]:
+        self.calls += 1
+        if int(frame[0, 0, 0]) >= 100:
+            return [PersonDetection(BoundingBox(1, 1, 20, 20), 0.9)]
+        return []
+
+
+class LatePersonInSameSecondCapture:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.position = 0
+        self.frames = [
+            np.zeros((48, 64, 3), dtype=np.uint8),
+            np.zeros((48, 64, 3), dtype=np.uint8),
+            np.full((48, 64, 3), 120, dtype=np.uint8),
+            np.full((48, 64, 3), 130, dtype=np.uint8),
+        ]
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(len(self.frames))
+        if prop == cv2.CAP_PROP_FPS:
+            return 4.0
+        return 0.0
+
+    def read(self):
+        if self.position >= len(self.frames):
+            return False, None
+        frame = self.frames[self.position]
+        self.position += 1
+        return True, frame
+
+    def set(self, prop: int, value: float) -> bool:
+        if prop != cv2.CAP_PROP_POS_FRAMES or int(value) > len(self.frames):
+            return False
+        self.position = int(value)
+        return True
+
+    def release(self) -> None:
+        pass
+
+
+def test_analyze_video_checks_later_candidates_in_same_second(tmp_path):
+    detector = LatePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(sample_fps=1.0, max_candidate_frames_per_slot=4, output_directory=tmp_path / "output_results"),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+    )
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", LatePersonInSameSecondCapture):
+        events = analyzer.analyze_video(tmp_path / "late-person.mp4", NeverStop())
+
+    assert detector.calls >= 3
+    assert [event.timestamp for event in events] == ["00:00:00"]
+
+
+class UnderreportedFrameCountCapture:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.position = 0
+        self.frames = [
+            np.zeros((48, 64, 3), dtype=np.uint8),
+            np.full((48, 64, 3), 120, dtype=np.uint8),
+            np.full((48, 64, 3), 140, dtype=np.uint8),
+        ]
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return 1.0
+        if prop == cv2.CAP_PROP_FPS:
+            return 1.0
+        return 0.0
+
+    def read(self):
+        if self.position >= len(self.frames):
+            return False, None
+        frame = self.frames[self.position]
+        self.position += 1
+        return True, frame
+
+    def set(self, prop: int, value: float) -> bool:
+        if prop != cv2.CAP_PROP_POS_FRAMES or int(value) > len(self.frames):
+            return False
+        self.position = int(value)
+        return True
+
+    def release(self) -> None:
+        pass
+
+
+def test_analyze_video_does_not_stop_at_underreported_frame_count(tmp_path):
+    detector = FakePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+    )
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", UnderreportedFrameCountCapture):
+        events = analyzer.analyze_video(tmp_path / "underreported.mp4", NeverStop())
+
+    assert detector.calls == 3
+    assert [event.timestamp for event in events] == ["00:00:00", "00:00:01", "00:00:02"]
+
+
 def test_open_capture_prefers_ffmpeg_backend(tmp_path):
     calls = []
 

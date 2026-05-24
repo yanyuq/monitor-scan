@@ -60,12 +60,19 @@ class VideoAnalyzer:
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         video_fps = capture.get(cv2.CAP_PROP_FPS) or self.config.sample_fps
         frame_index = 0
-        last_processed_slot = -1
+        last_progress_slot = -1
+        detected_slots: set[int] = set()
+        scheduled_attempted_candidates: set[tuple[int, int]] = set()
+        motion_attempted_candidates: set[tuple[int, int]] = set()
+        consecutive_decode_failures = 0
 
         try:
-            while not stop_token.is_stopped() and self._has_remaining_frames(frame_index, total_frames):
+            while not stop_token.is_stopped():
                 ok, frame = capture.read()
                 if not ok:
+                    consecutive_decode_failures += 1
+                    if consecutive_decode_failures >= self.config.max_consecutive_decode_failures:
+                        break
                     if not self._skip_failed_frame(capture, frame_index, total_frames):
                         break
                     frame_index += 1
@@ -73,21 +80,30 @@ class VideoAnalyzer:
                         progress_callback(VideoProgress(path, self._progress(frame_index, total_frames)))
                     continue
 
-                sample_slot = self._sample_slot(frame_index, video_fps)
-                if sample_slot > last_processed_slot:
-                    last_processed_slot = sample_slot
-                    progress = self._progress(frame_index, total_frames)
+                consecutive_decode_failures = 0
+                frame_time_seconds = self._frame_time_seconds(capture, frame_index, video_fps)
+                sample_slot = self._sample_slot(frame_time_seconds)
+                if sample_slot > last_progress_slot:
+                    last_progress_slot = sample_slot
                     if progress_callback is not None:
-                        progress_callback(VideoProgress(path, progress))
+                        progress_callback(VideoProgress(path, self._progress(frame_index, total_frames)))
 
-                    if motion_detector.has_motion(frame):
-                        detections = self._detect_people(frame)
-                        if detections:
-                            timestamp = format_timestamp(frame_index / video_fps)
-                            event = self.result_writer.save_event(path, timestamp, frame, detections)
-                            events.append(event)
-                            if detection_callback is not None:
-                                detection_callback(event)
+                has_motion = motion_detector.has_motion(frame)
+                if sample_slot not in detected_slots and self._should_try_detection(
+                    sample_slot,
+                    frame_time_seconds,
+                    has_motion,
+                    scheduled_attempted_candidates,
+                    motion_attempted_candidates,
+                ):
+                    detections = self._detect_people(frame)
+                    if detections:
+                        timestamp = format_timestamp(frame_time_seconds)
+                        event = self.result_writer.save_event(path, timestamp, frame, detections)
+                        events.append(event)
+                        detected_slots.add(sample_slot)
+                        if detection_callback is not None:
+                            detection_callback(event)
 
                 frame_index += 1
         finally:
@@ -119,16 +135,41 @@ class VideoAnalyzer:
         capture.release()
         return cv2.VideoCapture(str(path))
 
-    def _sample_slot(self, frame_index: int, video_fps: float) -> int:
+    def _frame_time_seconds(self, capture, frame_index: int, video_fps: float) -> float:
+        position_msec = capture.get(cv2.CAP_PROP_POS_MSEC)
+        if position_msec > 0:
+            return position_msec / 1000
         safe_fps = video_fps if video_fps > 0 else self.config.sample_fps
-        return int(frame_index / safe_fps * self.config.sample_fps)
+        return frame_index / safe_fps
 
-    def _has_remaining_frames(self, frame_index: int, total_frames: int) -> bool:
-        return total_frames <= 0 or frame_index < total_frames
+    def _sample_slot(self, frame_time_seconds: float) -> int:
+        return int(frame_time_seconds * self.config.sample_fps)
+
+    def _candidate_bucket(self, frame_time_seconds: float) -> int:
+        slot_duration = 1 / self.config.sample_fps
+        slot_start = self._sample_slot(frame_time_seconds) * slot_duration
+        slot_offset = max(0.0, frame_time_seconds - slot_start)
+        bucket = int(slot_offset / slot_duration * self.config.max_candidate_frames_per_slot)
+        return min(self.config.max_candidate_frames_per_slot - 1, bucket)
+
+    def _should_try_detection(
+        self,
+        sample_slot: int,
+        frame_time_seconds: float,
+        has_motion: bool,
+        scheduled_attempted_candidates: set[tuple[int, int]],
+        motion_attempted_candidates: set[tuple[int, int]],
+    ) -> bool:
+        candidate_key = (sample_slot, self._candidate_bucket(frame_time_seconds))
+        if candidate_key not in scheduled_attempted_candidates:
+            scheduled_attempted_candidates.add(candidate_key)
+            return True
+        if has_motion and candidate_key not in motion_attempted_candidates:
+            motion_attempted_candidates.add(candidate_key)
+            return True
+        return False
 
     def _skip_failed_frame(self, capture, frame_index: int, total_frames: int) -> bool:
-        if total_frames <= 0 or frame_index + 1 >= total_frames:
-            return False
         return bool(capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index + 1))
 
     def _progress(self, frame_index: int, total_frames: int) -> int:
