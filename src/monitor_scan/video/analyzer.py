@@ -51,7 +51,7 @@ class VideoAnalyzer:
         detection_callback: Callable[[DetectionEvent], None] | None = None,
     ) -> list[DetectionEvent]:
         path = Path(video_path)
-        capture = cv2.VideoCapture(str(path))
+        capture = self._open_capture(path)
         if not capture.isOpened():
             raise OSError(f"视频无法打开：{path}")
 
@@ -59,8 +59,8 @@ class VideoAnalyzer:
         motion_detector = self.motion_detector_factory()
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         video_fps = capture.get(cv2.CAP_PROP_FPS) or self.config.sample_fps
-        interval = max(1, round(video_fps / self.config.sample_fps))
         frame_index = 0
+        last_processed_slot = -1
 
         try:
             while not stop_token.is_stopped() and self._has_remaining_frames(frame_index, total_frames):
@@ -73,7 +73,9 @@ class VideoAnalyzer:
                         progress_callback(VideoProgress(path, self._progress(frame_index, total_frames)))
                     continue
 
-                if frame_index % interval == 0:
+                sample_slot = self._sample_slot(frame_index, video_fps)
+                if sample_slot > last_processed_slot:
+                    last_processed_slot = sample_slot
                     progress = self._progress(frame_index, total_frames)
                     if progress_callback is not None:
                         progress_callback(VideoProgress(path, progress))
@@ -109,6 +111,17 @@ class VideoAnalyzer:
 
     def _default_motion_detector(self) -> MotionDetector:
         return MotionDetector(self.config.motion_threshold)
+
+    def _open_capture(self, path: Path):
+        capture = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+        if capture.isOpened():
+            return capture
+        capture.release()
+        return cv2.VideoCapture(str(path))
+
+    def _sample_slot(self, frame_index: int, video_fps: float) -> int:
+        safe_fps = video_fps if video_fps > 0 else self.config.sample_fps
+        return int(frame_index / safe_fps * self.config.sample_fps)
 
     def _has_remaining_frames(self, frame_index: int, total_frames: int) -> bool:
         return total_frames <= 0 or frame_index < total_frames

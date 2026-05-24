@@ -93,7 +93,8 @@ def test_analyze_video_respects_stop_token(tmp_path):
 
 
 class BrokenMiddleFrameCapture:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.api_preference = api_preference
         self.position = 0
         self.frames = [
             np.zeros((48, 64, 3), dtype=np.uint8),
@@ -144,3 +145,78 @@ def test_analyze_video_skips_broken_frame_and_continues(tmp_path):
 
     assert detector.calls == 2
     assert [event.timestamp for event in events] == ["00:00:00", "00:00:02"]
+
+
+class BrokenFirstFrameInSecondCapture:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.position = 0
+        self.frames = [
+            None,
+            np.full((48, 64, 3), 120, dtype=np.uint8),
+            np.full((48, 64, 3), 140, dtype=np.uint8),
+        ]
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(len(self.frames))
+        if prop == cv2.CAP_PROP_FPS:
+            return 30.0
+        return 0.0
+
+    def read(self):
+        if self.position >= len(self.frames):
+            return False, None
+        frame = self.frames[self.position]
+        if frame is None:
+            return False, None
+        self.position += 1
+        return True, frame
+
+    def set(self, prop: int, value: float) -> bool:
+        if prop != cv2.CAP_PROP_POS_FRAMES:
+            return False
+        self.position = int(value)
+        return True
+
+    def release(self) -> None:
+        pass
+
+
+def test_analyze_video_uses_next_valid_frame_in_same_sample_slot(tmp_path):
+    detector = FakePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+    )
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", BrokenFirstFrameInSecondCapture):
+        events = analyzer.analyze_video(tmp_path / "broken-start.mp4", NeverStop())
+
+    assert detector.calls == 1
+    assert [event.timestamp for event in events] == ["00:00:00"]
+
+
+def test_open_capture_prefers_ffmpeg_backend(tmp_path):
+    calls = []
+
+    class OpenedCapture:
+        def __init__(self, *args) -> None:
+            calls.append(args)
+
+        def isOpened(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            pass
+
+    analyzer = VideoAnalyzer(AppConfig(output_directory=tmp_path / "output_results"))
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", OpenedCapture):
+        capture = analyzer._open_capture(tmp_path / "sample.mp4")
+
+    assert capture.isOpened()
+    assert calls == [(str(tmp_path / "sample.mp4"), cv2.CAP_FFMPEG)]
