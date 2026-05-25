@@ -75,7 +75,7 @@ class ResultWriter:
             raise OSError(f"截图保存失败：{snapshot_path}")
 
         confidence = max(detection.confidence for detection in detections)
-        snapshot_display_path = str(snapshot_path.relative_to(self.output_directory.parent))
+        snapshot_display_path = snapshot_path.relative_to(self.output_directory.parent).as_posix()
         event = DetectionEvent(
             video_name=video.name,
             timestamp=timestamp,

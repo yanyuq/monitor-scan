@@ -44,6 +44,8 @@ def main() -> int:
         "onnxruntime",
         "--collect-all",
         "cv2",
+        "--collect-all",
+        "imageio_ffmpeg",
         "--collect-submodules",
         "PyQt6",
         str(REPO_ROOT / "src" / "monitor_scan" / "__main__.py"),
@@ -51,6 +53,10 @@ def main() -> int:
     if sys.platform == "darwin":
         command[command.index("--name") : command.index("--name") + 2] = ["--name", "监控视频智能分析系统"]
         command.extend(["--osx-bundle-identifier", "com.yanyuq.monitor-scan"])
+        command.extend(["--codesign-identity", "-"])
+        target_arch = _macos_target_arch(args.target)
+        if target_arch is not None:
+            command.extend(["--target-architecture", target_arch])
 
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
@@ -58,6 +64,9 @@ def main() -> int:
     package_root.mkdir(parents=True, exist_ok=True)
     _copy_dist_outputs(package_root)
     _copy_if_exists(REPO_ROOT / "README.md", package_root / "README.md")
+    if sys.platform == "darwin":
+        _sign_macos_apps(package_root)
+        _write_macos_launcher(package_root)
 
     archive_base = release_dir / f"{APP_NAME}-{args.target}"
     if args.target.startswith("windows"):
@@ -78,7 +87,7 @@ def _copy_dist_outputs(package_root: Path) -> None:
     for output in outputs:
         target = package_root / output.name
         if output.is_dir():
-            shutil.copytree(output, target)
+            shutil.copytree(output, target, symlinks=True)
         else:
             shutil.copy2(output, target)
 
@@ -88,9 +97,41 @@ def _copy_if_exists(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
+def _macos_target_arch(target: str) -> str | None:
+    if not target.startswith("macos-"):
+        return None
+    arch = target.removeprefix("macos-")
+    if arch not in {"arm64", "x86_64", "universal2"}:
+        raise SystemExit(f"不支持的 macOS 架构：{arch}")
+    return arch
+
+
+def _sign_macos_apps(package_root: Path) -> None:
+    for app in package_root.glob("*.app"):
+        subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
+
+
+def _write_macos_launcher(package_root: Path) -> None:
+    launcher = package_root / "启动.command"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "DIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+        "APP=\"$DIR/监控视频智能分析系统.app\"\n"
+        "xattr -dr com.apple.quarantine \"$APP\" 2>/dev/null || true\n"
+        "open \"$APP\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+
 def _remove(path: Path) -> None:
     if path.is_dir():
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            for metadata_file in path.rglob(".DS_Store"):
+                metadata_file.unlink(missing_ok=True)
+            shutil.rmtree(path)
     elif path.exists():
         path.unlink()
 

@@ -9,6 +9,7 @@ import numpy as np
 from monitor_scan.config import AppConfig
 from monitor_scan.types import BoundingBox, PersonDetection
 from monitor_scan.video.analyzer import VideoAnalyzer
+from monitor_scan.video.remuxer import PreparedVideo
 
 
 class NeverStop:
@@ -57,7 +58,7 @@ def test_analyze_video_uses_motion_then_detector_and_writes_events(tmp_path):
     progress_values: list[int] = []
     events_seen = []
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=2.0, output_directory=tmp_path / "output_results"),
+        AppConfig(sample_fps=2.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -81,7 +82,7 @@ def test_analyze_video_respects_stop_token(tmp_path):
     make_video(video_path)
     detector = FakePersonDetector()
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=2.0, output_directory=tmp_path / "output_results"),
+        AppConfig(sample_fps=2.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -135,7 +136,7 @@ class BrokenMiddleFrameCapture:
 def test_analyze_video_skips_broken_frame_and_continues(tmp_path):
     detector = FakePersonDetector()
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -188,7 +189,7 @@ class BrokenFirstFrameInSecondCapture:
 def test_analyze_video_uses_next_valid_frame_in_same_sample_slot(tmp_path):
     detector = FakePersonDetector()
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -251,7 +252,12 @@ class LatePersonInSameSecondCapture:
 def test_analyze_video_checks_later_candidates_in_same_second(tmp_path):
     detector = LatePersonDetector()
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=1.0, max_candidate_frames_per_slot=4, output_directory=tmp_path / "output_results"),
+        AppConfig(
+            sample_fps=1.0,
+            max_candidate_frames_per_slot=4,
+            output_directory=tmp_path / "output_results",
+            remux_before_analysis=False,
+        ),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -302,7 +308,7 @@ class UnderreportedFrameCountCapture:
 def test_analyze_video_does_not_stop_at_underreported_frame_count(tmp_path):
     detector = FakePersonDetector()
     analyzer = VideoAnalyzer(
-        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
         motion_detector_factory=AlwaysMotionDetector,
         person_detector=detector,
     )
@@ -327,10 +333,78 @@ def test_open_capture_prefers_ffmpeg_backend(tmp_path):
         def release(self) -> None:
             pass
 
-    analyzer = VideoAnalyzer(AppConfig(output_directory=tmp_path / "output_results"))
+    analyzer = VideoAnalyzer(AppConfig(output_directory=tmp_path / "output_results", remux_before_analysis=False))
 
     with patch("monitor_scan.video.analyzer.cv2.VideoCapture", OpenedCapture):
         capture = analyzer._open_capture(tmp_path / "sample.mp4")
 
     assert capture.isOpened()
     assert calls == [(str(tmp_path / "sample.mp4"), cv2.CAP_FFMPEG)]
+
+
+class SingleFrameCapture:
+    opened_paths: list[str] = []
+
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.opened_paths.append(path)
+        self.position = 0
+        self.frames = [np.full((48, 64, 3), 120, dtype=np.uint8)]
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(len(self.frames))
+        if prop == cv2.CAP_PROP_FPS:
+            return 1.0
+        return 0.0
+
+    def read(self):
+        if self.position >= len(self.frames):
+            return False, None
+        frame = self.frames[self.position]
+        self.position += 1
+        return True, frame
+
+    def set(self, prop: int, value: float) -> bool:
+        return False
+
+    def release(self) -> None:
+        pass
+
+
+class FakeRemuxer:
+    def __init__(self, temporary_directory: Path, analysis_path: Path) -> None:
+        self.temporary_directory = temporary_directory
+        self.analysis_path = analysis_path
+
+    def prepare(self, video_path: str | Path) -> PreparedVideo:
+        self.temporary_directory.mkdir()
+        self.analysis_path.write_bytes(b"video")
+        return PreparedVideo(
+            source_path=Path(video_path),
+            analysis_path=self.analysis_path,
+            temporary_directory=self.temporary_directory,
+        )
+
+
+def test_analyze_video_reads_remuxed_file_and_reports_source_name(tmp_path):
+    source_path = tmp_path / "source.mp4"
+    temporary_directory = tmp_path / ".monitor_scan_source_test"
+    analysis_path = temporary_directory / "source_remuxed.mp4"
+    detector = FakePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results"),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+        remuxer=FakeRemuxer(temporary_directory, analysis_path),
+    )
+    SingleFrameCapture.opened_paths = []
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", SingleFrameCapture):
+        events = analyzer.analyze_video(source_path, NeverStop())
+
+    assert SingleFrameCapture.opened_paths == [str(analysis_path)]
+    assert [event.video_name for event in events] == ["source.mp4"]
+    assert not temporary_directory.exists()

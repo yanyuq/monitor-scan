@@ -25,6 +25,9 @@ class AppConfig:
     nms_threshold: float = 0.45
     max_candidate_frames_per_slot: int = 5
     max_consecutive_decode_failures: int = 300
+    remux_before_analysis: bool = True
+    ffmpeg_path: str = "ffmpeg"
+    ffmpeg_timeout_seconds: int = 1800
 
     def validate(self) -> None:
         if self.sample_fps <= 0:
@@ -37,3 +40,7 @@ class AppConfig:
             raise ValueError("模型输入尺寸必须大于 0。")
         if self.max_candidate_frames_per_slot <= 0:
             raise ValueError("每个采样时间槽的候选帧数量必须大于 0。")
+        if self.max_consecutive_decode_failures <= 0:
+            raise ValueError("连续解码失败上限必须大于 0。")
+        if self.ffmpeg_timeout_seconds <= 0:
+            raise ValueError("FFmpeg 处理超时时间必须大于 0。")

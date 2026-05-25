@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python>=4.9",
     "onnxruntime>=1.17",
     "PyQt6>=6.6",
+    "imageio-ffmpeg>=0.5",
 ]
 
 [project.optional-dependencies]

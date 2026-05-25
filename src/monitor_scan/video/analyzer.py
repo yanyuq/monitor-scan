@@ -11,6 +11,7 @@ from monitor_scan.ai.motion import MotionDetector
 from monitor_scan.config import AppConfig
 from monitor_scan.results.writer import ResultWriter, format_timestamp
 from monitor_scan.types import DetectionEvent, PersonDetection
+from monitor_scan.video.remuxer import FfmpegRemuxer, PreparedVideo
 
 
 class StopToken(Protocol):
@@ -36,12 +37,14 @@ class VideoAnalyzer:
         motion_detector_factory: Callable[[], MotionDetector] | None = None,
         person_detector: PersonDetector | None = None,
         result_writer: ResultWriter | None = None,
+        remuxer: FfmpegRemuxer | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.motion_detector_factory = motion_detector_factory or self._default_motion_detector
         self.person_detector = person_detector
         self.result_writer = result_writer or ResultWriter(config.output_directory)
+        self.remuxer = remuxer or FfmpegRemuxer(config.ffmpeg_path, config.ffmpeg_timeout_seconds)
 
     def analyze_video(
         self,
@@ -50,11 +53,31 @@ class VideoAnalyzer:
         progress_callback: Callable[[VideoProgress], None] | None = None,
         detection_callback: Callable[[DetectionEvent], None] | None = None,
     ) -> list[DetectionEvent]:
-        path = Path(video_path)
-        capture = self._open_capture(path)
-        if not capture.isOpened():
-            raise OSError(f"视频无法打开：{path}")
+        source_path = Path(video_path)
+        prepared_video = self._prepare_video(source_path)
+        capture = self._open_capture(prepared_video.analysis_path)
+        try:
+            if not capture.isOpened():
+                raise OSError(f"视频无法打开：{source_path}")
+            return self._analyze_capture(
+                capture,
+                source_path,
+                stop_token,
+                progress_callback,
+                detection_callback,
+            )
+        finally:
+            capture.release()
+            prepared_video.cleanup()
 
+    def _analyze_capture(
+        self,
+        capture,
+        source_path: Path,
+        stop_token: StopToken,
+        progress_callback: Callable[[VideoProgress], None] | None,
+        detection_callback: Callable[[DetectionEvent], None] | None,
+    ) -> list[DetectionEvent]:
         events: list[DetectionEvent] = []
         motion_detector = self.motion_detector_factory()
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -66,52 +89,56 @@ class VideoAnalyzer:
         motion_attempted_candidates: set[tuple[int, int]] = set()
         consecutive_decode_failures = 0
 
-        try:
-            while not stop_token.is_stopped():
-                ok, frame = capture.read()
-                if not ok:
-                    consecutive_decode_failures += 1
-                    if consecutive_decode_failures >= self.config.max_consecutive_decode_failures:
-                        break
-                    if not self._skip_failed_frame(capture, frame_index, total_frames):
-                        break
-                    frame_index += 1
-                    if progress_callback is not None:
-                        progress_callback(VideoProgress(path, self._progress(frame_index, total_frames)))
-                    continue
-
-                consecutive_decode_failures = 0
-                frame_time_seconds = self._frame_time_seconds(capture, frame_index, video_fps)
-                sample_slot = self._sample_slot(frame_time_seconds)
-                if sample_slot > last_progress_slot:
-                    last_progress_slot = sample_slot
-                    if progress_callback is not None:
-                        progress_callback(VideoProgress(path, self._progress(frame_index, total_frames)))
-
-                has_motion = motion_detector.has_motion(frame)
-                if sample_slot not in detected_slots and self._should_try_detection(
-                    sample_slot,
-                    frame_time_seconds,
-                    has_motion,
-                    scheduled_attempted_candidates,
-                    motion_attempted_candidates,
-                ):
-                    detections = self._detect_people(frame)
-                    if detections:
-                        timestamp = format_timestamp(frame_time_seconds)
-                        event = self.result_writer.save_event(path, timestamp, frame, detections)
-                        events.append(event)
-                        detected_slots.add(sample_slot)
-                        if detection_callback is not None:
-                            detection_callback(event)
-
+        while not stop_token.is_stopped():
+            ok, frame = capture.read()
+            if not ok:
+                consecutive_decode_failures += 1
+                if consecutive_decode_failures >= self.config.max_consecutive_decode_failures:
+                    break
+                if not self._skip_failed_frame(capture, frame_index, total_frames):
+                    break
                 frame_index += 1
-        finally:
-            capture.release()
+                if progress_callback is not None:
+                    progress_callback(VideoProgress(source_path, self._progress(frame_index, total_frames)))
+                continue
+
+            consecutive_decode_failures = 0
+            frame_time_seconds = self._frame_time_seconds(capture, frame_index, video_fps)
+            sample_slot = self._sample_slot(frame_time_seconds)
+            if sample_slot > last_progress_slot:
+                last_progress_slot = sample_slot
+                if progress_callback is not None:
+                    progress_callback(VideoProgress(source_path, self._progress(frame_index, total_frames)))
+
+            has_motion = motion_detector.has_motion(frame)
+            if sample_slot not in detected_slots and self._should_try_detection(
+                sample_slot,
+                frame_time_seconds,
+                has_motion,
+                scheduled_attempted_candidates,
+                motion_attempted_candidates,
+            ):
+                detections = self._detect_people(frame)
+                if detections:
+                    timestamp = format_timestamp(frame_time_seconds)
+                    event = self.result_writer.save_event(source_path, timestamp, frame, detections)
+                    events.append(event)
+                    detected_slots.add(sample_slot)
+                    if detection_callback is not None:
+                        detection_callback(event)
+
+            frame_index += 1
 
         if progress_callback is not None:
-            progress_callback(VideoProgress(path, 100 if not stop_token.is_stopped() else self._progress(frame_index, total_frames)))
+            progress_callback(
+                VideoProgress(source_path, 100 if not stop_token.is_stopped() else self._progress(frame_index, total_frames))
+            )
         return events
+
+    def _prepare_video(self, source_path: Path) -> PreparedVideo:
+        if not self.config.remux_before_analysis:
+            return PreparedVideo(source_path=source_path, analysis_path=source_path)
+        return self.remuxer.prepare(source_path)
 
     def _detect_people(self, frame) -> list[PersonDetection]:
         if self.person_detector is None:
