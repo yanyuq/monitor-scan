@@ -15,6 +15,26 @@ build_package = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(build_package)
 
 
+class FakeStream:
+    def __init__(self) -> None:
+        self.reconfigure_calls = []
+
+    def reconfigure(self, **kwargs) -> None:
+        self.reconfigure_calls.append(kwargs)
+
+
+def test_configure_standard_streams_uses_utf8(monkeypatch):
+    stdout = FakeStream()
+    stderr = FakeStream()
+    monkeypatch.setattr(build_package.sys, "stdout", stdout)
+    monkeypatch.setattr(build_package.sys, "stderr", stderr)
+
+    build_package._configure_standard_streams()
+
+    assert stdout.reconfigure_calls == [{"encoding": "utf-8"}]
+    assert stderr.reconfigure_calls == [{"encoding": "utf-8"}]
+
+
 def test_macos_target_arch_accepts_supported_targets():
     assert build_package._macos_target_arch("macos-arm64") == "arm64"
     assert build_package._macos_target_arch("linux-x86_64") is None

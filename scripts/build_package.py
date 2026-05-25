@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> int:
+    _configure_standard_streams()
     parser = argparse.ArgumentParser(description="构建监控视频智能分析系统运行包")
     parser.add_argument("--target", required=True, help="运行包目标平台标识，例如 windows-x86_64")
     args = parser.parse_args()
@@ -76,6 +77,13 @@ def main() -> int:
 
     print(f"已生成运行包：{archive}")
     return 0
+
+
+def _configure_standard_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
 def _copy_dist_outputs(package_root: Path) -> None:
