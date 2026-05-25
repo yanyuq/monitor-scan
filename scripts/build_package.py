@@ -9,6 +9,10 @@ from pathlib import Path
 
 APP_NAME = "monitor-scan"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MODEL_DIRECTORY = REPO_ROOT / "models"
+YOLO_SOURCE_MODEL_PATH = MODEL_DIRECTORY / "yolo26n.pt"
+YOLO_COREML_MODEL_PATH = MODEL_DIRECTORY / "yolo26n.mlpackage"
+COREML_EXPORT_SCRIPT = REPO_ROOT / "scripts" / "export_coreml_model.py"
 
 
 def main() -> int:
@@ -17,7 +21,9 @@ def main() -> int:
     parser.add_argument("--target", required=True, help="运行包目标平台标识，例如 windows-x86_64")
     args = parser.parse_args()
 
-    model_path = REPO_ROOT / "models" / "yolov8n.onnx"
+    model_path = _model_path_for_target(args.target)
+    if _target_uses_coreml(args.target):
+        _ensure_coreml_model()
     if not model_path.exists():
         raise SystemExit(f"缺少模型文件，无法打包：{model_path}")
 
@@ -40,18 +46,25 @@ def main() -> int:
         "--paths",
         str(REPO_ROOT / "src"),
         "--add-data",
-        f"{model_path}{separator}models",
+        f"{model_path}{separator}{_model_data_destination(model_path)}",
         "--collect-all",
         "onnxruntime",
         "--collect-all",
         "cv2",
         "--collect-all",
         "imageio_ffmpeg",
+        "--collect-all",
+        "ultralytics",
+        "--collect-all",
+        "torch",
+        "--collect-all",
+        "torchvision",
         "--collect-submodules",
         "PyQt6",
         str(REPO_ROOT / "src" / "monitor_scan" / "__main__.py"),
     ]
     if sys.platform == "darwin":
+        command.extend(["--collect-all", "coremltools"])
         command[command.index("--name") : command.index("--name") + 2] = ["--name", "监控视频智能分析系统"]
         command.extend(["--osx-bundle-identifier", "com.yanyuq.monitor-scan"])
         command.extend(["--codesign-identity", "-"])
@@ -77,6 +90,41 @@ def main() -> int:
 
     print(f"已生成运行包：{archive}")
     return 0
+
+
+def _model_path_for_target(target: str) -> Path:
+    if _target_uses_coreml(target):
+        return YOLO_COREML_MODEL_PATH
+    return YOLO_SOURCE_MODEL_PATH
+
+
+def _model_data_destination(model_path: Path) -> str:
+    if model_path.is_dir():
+        return f"models/{model_path.name}"
+    return "models"
+
+
+def _target_uses_coreml(target: str) -> bool:
+    return target.startswith("macos-") or (target == "local" and sys.platform == "darwin")
+
+
+def _ensure_coreml_model() -> None:
+    if not YOLO_SOURCE_MODEL_PATH.exists():
+        raise SystemExit(f"缺少 yolo26n 源模型，无法导出 CoreML：{YOLO_SOURCE_MODEL_PATH}")
+    if YOLO_COREML_MODEL_PATH.exists() and YOLO_COREML_MODEL_PATH.stat().st_mtime >= YOLO_SOURCE_MODEL_PATH.stat().st_mtime:
+        return
+    subprocess.run(
+        [
+            sys.executable,
+            str(COREML_EXPORT_SCRIPT),
+            "--source",
+            str(YOLO_SOURCE_MODEL_PATH),
+            "--output",
+            str(YOLO_COREML_MODEL_PATH),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
 
 def _configure_standard_streams() -> None:

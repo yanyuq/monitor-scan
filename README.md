@@ -1,6 +1,6 @@
 # 监控视频智能分析系统
 
-这是一个跨平台桌面工具，用于批量分析监控视频中的人形事件。程序会先用 OpenCV 做画面运动检测，只有画面发生明显变化时才调用 YOLOv8n ONNX 模型进行人形识别，从而减少长视频分析时的计算量。
+这是一个跨平台桌面工具，用于批量分析监控视频中的人形事件。程序会先用 OpenCV 做画面运动检测，只有画面发生明显变化时才调用 yolo26n 模型进行人形识别，从而减少长视频分析时的计算量。macOS 端优先使用 CoreML `.mlpackage` 模型，以利用 Apple 芯片的专用推理能力。
 
 ## 功能特性
 
@@ -10,7 +10,7 @@
 - 默认先用 FFmpeg 无重编码重封装视频，重建索引并纠正时间戳。
 - 支持抽帧频率和 AI 置信度阈值配置。
 - 使用 OpenCV 运动检测作为前置过滤。
-- 使用 ONNX Runtime 运行 YOLOv8n 模型识别人形。
+- 使用 yolo26n 模型识别人形，macOS 端优先加载 CoreML 模型。
 - 检测到人形后自动保存带红框截图。
 - 自动生成 CSV 检测报告。
 - 使用 PyQt6 图形界面，后台线程分析视频，避免界面卡死。
@@ -20,7 +20,8 @@
 ```text
 monitor-scan/
 ├── models/
-│   └── yolov8n.onnx
+│   ├── yolo26n.pt
+│   └── yolo26n.mlpackage
 ├── src/monitor_scan/
 │   ├── ai/
 │   ├── gui/
@@ -35,15 +36,21 @@ monitor-scan/
 
 ## 模型文件
 
-程序默认读取以下模型文件：
+程序默认使用以下模型文件：
 
 ```text
-models/yolov8n.onnx
+models/yolo26n.pt
 ```
 
-本项目不会在运行时自动下载模型。运行或打包前，请确认该文件已经存在。
+macOS 端如果存在以下 CoreML 模型，会优先加载它：
 
-如果是通过 GitHub Actions 打包发布，也需要确保 `models/yolov8n.onnx` 已经提交到仓库，或通过 Git LFS 管理并能在 workflow 中正常拉取。
+```text
+models/yolo26n.mlpackage
+```
+
+本项目不会在运行时自动下载模型。运行或打包前，请确认 `models/yolo26n.pt` 已经存在。macOS 打包时会在缺少或过期时尝试从 `models/yolo26n.pt` 导出 `models/yolo26n.mlpackage`。
+
+如果是通过 GitHub Actions 打包发布，也需要确保 `models/yolo26n.pt` 已经提交到仓库，或通过 Git LFS 管理并能在 workflow 中正常拉取。
 
 ## 本地开发环境
 
@@ -75,7 +82,7 @@ python -m monitor_scan
 
 ## 使用流程
 
-1. 准备模型文件：确认 `models/yolov8n.onnx` 存在。
+1. 准备模型文件：确认 `models/yolo26n.pt` 存在；macOS 可先执行 `python scripts/export_coreml_model.py` 生成 `models/yolo26n.mlpackage`。
 2. 启动程序。
 3. 点击“选择文件夹”，选择包含监控视频的目录。
 4. 根据需要调整“抽帧频率”和“AI 灵敏度”。
@@ -176,5 +183,5 @@ release/
 - Windows 和 Linux 的 workflow 构建目标为 x86_64，不是 32 位 x86。
 - macOS workflow 使用 `macos-14` runner，目标为 Apple Silicon arm64。
 - macOS 运行包内包含 `启动.command`，用于移除解压后可能携带的隔离属性并启动应用。
-- 打包前必须存在 `models/yolov8n.onnx`。
+- 打包前必须存在 `models/yolo26n.pt`；macOS 运行包会优先包含 `models/yolo26n.mlpackage`。
 - 真实识别效果取决于模型质量、视频清晰度、抽帧频率和置信度阈值。

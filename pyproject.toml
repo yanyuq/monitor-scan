@@ -9,9 +9,12 @@ description = "监控视频智能分析桌面工具"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=1.26",
+    "numpy>=1.26,<=2.3.5",
+    "lap>=0.5.12",
     "opencv-python>=4.9",
     "onnxruntime>=1.17",
+    "ultralytics>=8.3",
+    "coremltools>=8.0; platform_system == 'Darwin'",
     "PyQt6>=6.6",
     "imageio-ffmpeg>=0.5",
 ]

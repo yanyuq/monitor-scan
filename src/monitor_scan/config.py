@@ -5,13 +5,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SUPPORTED_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv"})
+MODEL_DIRECTORY = "models"
+YOLO_SOURCE_MODEL_NAME = "yolo26n.pt"
+YOLO_COREML_MODEL_NAME = "yolo26n.mlpackage"
 
 
 def default_model_path() -> Path:
+    model_root = _model_root()
+    if sys.platform == "darwin":
+        coreml_model_path = model_root / YOLO_COREML_MODEL_NAME
+        if coreml_model_path.exists():
+            return coreml_model_path
+    return model_root / YOLO_SOURCE_MODEL_NAME
+
+
+def _model_root() -> Path:
     bundle_root = getattr(sys, "_MEIPASS", None)
     if bundle_root is not None:
-        return Path(bundle_root) / "models" / "yolov8n.onnx"
-    return Path("models/yolov8n.onnx")
+        return Path(bundle_root) / MODEL_DIRECTORY
+    return Path(MODEL_DIRECTORY)
 
 
 @dataclass(frozen=True)
