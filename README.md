@@ -135,18 +135,17 @@ no frame!
 
 该 workflow 只能手动触发。触发后会：
 
-1. 在 Windows x86_64、Linux x86_64、macOS Intel、macOS Apple Silicon 四个目标分别安装依赖。
+1. 在 Windows x86_64、Linux x86_64、macOS Apple Silicon 三个目标分别安装依赖。
 2. 执行本地测试。
 3. 使用 PyInstaller 打包运行包。
 4. 创建当前日期版本号的 GitHub Release，例如 `v20260525`。
-5. 上传四个平台的运行包到 Release。
+5. 上传三个平台的运行包到 Release。
 
 打包产物命名示例：
 
 ```text
 monitor-scan-windows-x86_64.zip
 monitor-scan-linux-x86_64.tar.gz
-monitor-scan-macos-x86_64.tar.gz
 monitor-scan-macos-arm64.tar.gz
 ```
 
@@ -175,7 +174,7 @@ release/
 ## 注意事项
 
 - Windows 和 Linux 的 workflow 构建目标为 x86_64，不是 32 位 x86。
-- macOS workflow 同时构建 Intel x86_64 与 Apple Silicon arm64，下载时请按本机芯片选择对应运行包。
+- macOS workflow 使用 `macos-14` runner，目标为 Apple Silicon arm64。
 - macOS 运行包内包含 `启动.command`，用于移除解压后可能携带的隔离属性并启动应用。
 - 打包前必须存在 `models/yolov8n.onnx`。
 - 真实识别效果取决于模型质量、视频清晰度、抽帧频率和置信度阈值。

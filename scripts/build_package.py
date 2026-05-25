@@ -101,7 +101,7 @@ def _macos_target_arch(target: str) -> str | None:
     if not target.startswith("macos-"):
         return None
     arch = target.removeprefix("macos-")
-    if arch not in {"arm64", "x86_64", "universal2"}:
+    if arch != "arm64":
         raise SystemExit(f"不支持的 macOS 架构：{arch}")
     return arch
 
