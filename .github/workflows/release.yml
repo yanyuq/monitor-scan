@@ -60,7 +60,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: monitor-scan-${{ matrix.target }}
-          path: release/*
+          path: |
+            release/*.zip
+            release/*.tar.gz
           if-no-files-found: error
 
   release:
@@ -97,4 +99,4 @@ jobs:
             gh release create "${VERSION}" --title "${VERSION}" --notes-file "${NOTES_FILE}"
           fi
 
-          find release-assets -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 | xargs -0 gh release upload "${VERSION}" --clobber
+          find release-assets -type f \( -name 'monitor-scan-*.zip' -o -name 'monitor-scan-*.tar.gz' \) -print0 | xargs -0 -r gh release upload "${VERSION}" --clobber
