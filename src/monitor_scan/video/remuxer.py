@@ -76,13 +76,19 @@ class FfmpegRemuxer:
         self.timeout_seconds = timeout_seconds
         logger.debug(f"FFmpeg 重封装器初始化：路径={ffmpeg_path}，超时={timeout_seconds}秒")
 
-    def prepare(self, video_path: str | Path) -> PreparedVideo:
+    def prepare(
+        self,
+        video_path: str | Path,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> PreparedVideo:
         """准备视频文件。
 
-        使用 FFmpeg 进行无重编码重封装，如果失败则回退到原始文件。
+        使用 FFmpeg 进行重封装，如果失败则回退到原始文件。
+        当指定 roi=(x, y, width, height) 时，使用 crop 滤镜裁剪视频。
 
         Args:
             video_path: 视频文件路径
+            roi: 可选的检测区域 (x, y, width, height)，像素坐标
 
         Returns:
             准备好的视频信息
@@ -101,7 +107,7 @@ class FfmpegRemuxer:
 
         temporary_directory = self._create_temporary_directory(source_path)
         output_path = temporary_directory / f"{source_path.stem}_remuxed{source_path.suffix.lower()}"
-        command = self._build_command(executable, source_path, output_path)
+        command = self._build_command(executable, source_path, output_path, roi)
 
         logger.debug(f"执行 FFmpeg 命令：{' '.join(command)}")
 
@@ -130,20 +136,28 @@ class FfmpegRemuxer:
             return self._fallback(source_path, f"FFmpeg 重封装失败，已直接分析原视频：{stderr}")
 
         logger.info(f"FFmpeg 重封装成功：{output_path}")
+        roi_msg = f"（ROI 裁剪：{roi}）" if roi else ""
         return PreparedVideo(
             source_path=source_path,
             analysis_path=output_path,
             temporary_directory=temporary_directory,
-            message="FFmpeg 已完成无重编码索引重建。",
+            message=f"FFmpeg 已完成索引重建{roi_msg}。",
         )
 
-    def _build_command(self, executable: str, source_path: Path, output_path: Path) -> list[str]:
+    def _build_command(
+        self,
+        executable: str,
+        source_path: Path,
+        output_path: Path,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> list[str]:
         """构建 FFmpeg 命令。
 
         Args:
             executable: FFmpeg 可执行文件路径
             source_path: 源视频路径
             output_path: 输出视频路径
+            roi: 可选的裁剪区域 (x, y, width, height)
 
         Returns:
             FFmpeg 命令列表
@@ -157,10 +171,23 @@ class FfmpegRemuxer:
             "-fflags", "+genpts+discardcorrupt",
             "-i", str(source_path),
             "-map", "0:v:0",
-            "-c:v", "copy",
             "-an",
             "-avoid_negative_ts", "make_zero",
         ]
+
+        if roi is not None:
+            # 裁剪模式：需要重编码
+            x, y, w, h = roi
+            command.extend([
+                "-vf", f"crop={w}:{h}:{x}:{y}",
+                "-c:v", "libx264",
+                "-crf", "23",
+                "-preset", "fast",
+            ])
+            logger.debug(f"启用 ROI 裁剪：x={x}, y={y}, width={w}, height={h}")
+        else:
+            # 无裁剪：无重编码拷贝
+            command.extend(["-c:v", "copy"])
 
         # 对于 MOV 容器添加 faststart 标志
         if output_path.suffix.lower() in MOVIE_CONTAINER_FORMATS:

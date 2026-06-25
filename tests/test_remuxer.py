@@ -72,7 +72,7 @@ def test_prepare_returns_temporary_remuxed_file_and_cleanup(tmp_path):
     assert prepared.analysis_path.exists()
     assert prepared.temporary_directory is not None
     assert prepared.temporary_directory.name.startswith(".monitor_scan_camera_")
-    assert prepared.message == "FFmpeg 已完成无重编码索引重建。"
+    assert prepared.message == "FFmpeg 已完成索引重建。"
     assert captured["command"][0] == "/usr/bin/ffmpeg"
     assert captured["kwargs"]["timeout"] == 7
     assert "creationflags" not in captured["kwargs"]

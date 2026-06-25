@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import cv2
 from PyQt6.QtCore import QThread, Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -24,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from monitor_scan.config import AppConfig
+from monitor_scan.gui.roi_selector import RoiSelectorDialog
 from monitor_scan.types import DetectionEvent
 from monitor_scan.video.scanner import VideoScanner
 from monitor_scan.workers.analyzer_worker import AnalyzerWorker
@@ -94,6 +97,26 @@ class MainWindow(QMainWindow):
         self.confidence_input.setValue(0.5)
         self.confidence_input.setDecimals(2)
 
+        # ROI 检测区域输入（留空表示不裁剪）
+        self.roi_x_input = QSpinBox()
+        self.roi_x_input.setRange(0, 99999)
+        self.roi_x_input.setSpecialValueText("留空")
+        self.roi_x_input.setPrefix("X ")
+        self.roi_y_input = QSpinBox()
+        self.roi_y_input.setRange(0, 99999)
+        self.roi_y_input.setSpecialValueText("留空")
+        self.roi_y_input.setPrefix("Y ")
+        self.roi_w_input = QSpinBox()
+        self.roi_w_input.setRange(0, 99999)
+        self.roi_w_input.setSpecialValueText("留空")
+        self.roi_w_input.setPrefix("宽 ")
+        self.roi_h_input = QSpinBox()
+        self.roi_h_input.setRange(0, 99999)
+        self.roi_h_input.setSpecialValueText("留空")
+        self.roi_h_input.setPrefix("高 ")
+        self.roi_select_button = QPushButton("框选区域")
+        self.roi_select_button.setToolTip("加载视频首帧，鼠标拖拽框选检测区域")
+
         controls_layout.addWidget(self.choose_button, 0, 0)
         controls_layout.addWidget(self.directory_label, 0, 1, 1, 6)
         controls_layout.addWidget(QLabel("抽帧频率"), 1, 0)
@@ -102,6 +125,12 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.confidence_input, 1, 3)
         controls_layout.addWidget(self.start_button, 1, 4)
         controls_layout.addWidget(self.stop_button, 1, 5)
+        controls_layout.addWidget(QLabel("检测区域"), 2, 0)
+        controls_layout.addWidget(self.roi_x_input, 2, 1)
+        controls_layout.addWidget(self.roi_y_input, 2, 2)
+        controls_layout.addWidget(self.roi_w_input, 2, 3)
+        controls_layout.addWidget(self.roi_h_input, 2, 4)
+        controls_layout.addWidget(self.roi_select_button, 2, 5)
         layout.addWidget(controls)
 
         # 内容区域
@@ -139,6 +168,7 @@ class MainWindow(QMainWindow):
         self.choose_button.clicked.connect(self.choose_directory)
         self.start_button.clicked.connect(self.start_analysis)
         self.stop_button.clicked.connect(self.stop_analysis)
+        self.roi_select_button.clicked.connect(self._open_roi_selector)
 
     def choose_directory(self) -> None:
         """打开目录选择对话框。"""
@@ -146,6 +176,39 @@ class MainWindow(QMainWindow):
         if not directory:
             return
         self.load_directory(Path(directory))
+
+    def _open_roi_selector(self) -> None:
+        """打开 ROI 框选对话框，加载第一个视频的首帧。"""
+        if not self._videos:
+            QMessageBox.information(self, "没有视频", "请先加载包含视频文件的目录。")
+            return
+
+        video_path = self._videos[0]
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            QMessageBox.warning(self, "视频无法打开", f"无法读取视频首帧：{video_path.name}")
+            logger.warning(f"无法打开视频读取首帧：{video_path}")
+            return
+
+        try:
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+
+        if not ok or frame is None:
+            QMessageBox.warning(self, "读取失败", f"无法读取视频首帧：{video_path.name}")
+            logger.warning(f"读取视频首帧失败：{video_path}")
+            return
+
+        dialog = RoiSelectorDialog(frame, parent=self)
+        if dialog.exec() == RoiSelectorDialog.DialogCode.Accepted and dialog.roi is not None:
+            x, y, w, h = dialog.roi
+            self.roi_x_input.setValue(x)
+            self.roi_y_input.setValue(y)
+            self.roi_w_input.setValue(w)
+            self.roi_h_input.setValue(h)
+            self._append_log(f"已设置检测区域：X={x}, Y={y}, 宽={w}, 高={h}")
+            logger.info(f"用户框选 ROI：x={x}, y={y}, width={w}, height={h}")
 
     def load_directory(self, directory: Path) -> None:
         """加载指定目录中的视频文件。
@@ -248,6 +311,12 @@ class MainWindow(QMainWindow):
         if self._selected_directory is None:
             raise RuntimeError("请先选择包含监控视频的文件夹。")
 
+        # 读取 ROI 输入（0 表示留空/未设置）
+        roi_x = self.roi_x_input.value() or None
+        roi_y = self.roi_y_input.value() or None
+        roi_w = self.roi_w_input.value() or None
+        roi_h = self.roi_h_input.value() or None
+
         return AppConfig(
             sample_fps=self.sample_fps_input.value(),
             confidence_threshold=self.confidence_input.value(),
@@ -259,6 +328,10 @@ class MainWindow(QMainWindow):
             motion_resize_width=480,
             motion_area_ratio_threshold=0.01,
             motion_detect_shadows=False,
+            roi_x=roi_x,
+            roi_y=roi_y,
+            roi_width=roi_w,
+            roi_height=roi_h,
         )
 
     def _populate_videos(self, videos: list[Path]) -> None:
@@ -343,6 +416,11 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(not running)
         self.sample_fps_input.setEnabled(not running)
         self.confidence_input.setEnabled(not running)
+        self.roi_x_input.setEnabled(not running)
+        self.roi_y_input.setEnabled(not running)
+        self.roi_w_input.setEnabled(not running)
+        self.roi_h_input.setEnabled(not running)
+        self.roi_select_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
     def _append_log(self, message: str) -> None:

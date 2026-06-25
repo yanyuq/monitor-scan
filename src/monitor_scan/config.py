@@ -91,7 +91,7 @@ class AppConfig:
     max_motion_detections_per_slot: int = 2  # 增加到 2 次运动检测
 
     # 错误处理配置
-    max_consecutive_decode_failures: int = 300
+    max_consecutive_decode_failures: int = 3000
     max_consecutive_stalled_frames: int = 30
 
     # FFmpeg 配置
@@ -167,6 +167,19 @@ class AppConfig:
 
     # 置信度衰减系数：丢帧时间越长，置信度越低
     confidence_decay_factor: float = 0.95
+
+    # ==================== ROI 区域配置 ====================
+
+    # 检测区域（可选，像素坐标），全部为 None 时不裁剪
+    roi_x: int | None = None
+    roi_y: int | None = None
+    roi_width: int | None = None
+    roi_height: int | None = None
+
+    @property
+    def has_roi(self) -> bool:
+        """是否启用了 ROI 区域裁剪。"""
+        return any(v is not None for v in (self.roi_x, self.roi_y, self.roi_width, self.roi_height))
 
     def validate(self) -> None:
         """验证配置参数的有效性。
@@ -257,3 +270,14 @@ class AppConfig:
             raise ValueError("冗余检测次数不能为负数。")
         if not 0.0 < self.confidence_decay_factor <= 1.0:
             raise ValueError("置信度衰减系数必须在 0 到 1 之间。")
+
+        # ROI 区域配置验证
+        if self.has_roi:
+            if self.roi_x is None or self.roi_y is None or self.roi_width is None or self.roi_height is None:
+                raise ValueError("启用 ROI 时必须同时指定 x、y、width、height 四个参数。")
+            if self.roi_x < 0 or self.roi_y < 0:
+                raise ValueError("ROI 的 x 和 y 坐标不能为负数。")
+            if self.roi_width <= 0 or self.roi_height <= 0:
+                raise ValueError("ROI 的宽度和高度必须大于 0。")
+            if self.roi_width % 2 != 0 or self.roi_height % 2 != 0:
+                raise ValueError("ROI 的宽度和高度必须为偶数（FFmpeg 编码要求）。")

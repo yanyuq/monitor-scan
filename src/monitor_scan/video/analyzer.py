@@ -699,7 +699,7 @@ class VideoAnalyzer:
             logger.info(f"丢帧补偿检测完成，额外检测到 {redundant_count} 个事件")
 
     def _prepare_video(self, source_path: Path) -> PreparedVideo:
-        """准备视频文件，可选进行 FFmpeg 重封装。
+        """准备视频文件，可选进行 FFmpeg 重封装和 ROI 裁剪。
 
         Args:
             source_path: 原始视频路径
@@ -711,8 +711,14 @@ class VideoAnalyzer:
             logger.debug("跳过 FFmpeg 重封装，直接分析原视频")
             return PreparedVideo(source_path=source_path, analysis_path=source_path)
 
+        # 构建 ROI 参数
+        roi: tuple[int, int, int, int] | None = None
+        if self.config.has_roi:
+            roi = (self.config.roi_x, self.config.roi_y, self.config.roi_width, self.config.roi_height)
+            logger.debug(f"启用 ROI 裁剪：{roi}")
+
         logger.debug(f"开始 FFmpeg 重封装：{source_path}")
-        return self.remuxer.prepare(source_path)
+        return self.remuxer.prepare(source_path, roi=roi)
 
     def _detect_people(self, frame: np.ndarray) -> list[PersonDetection]:
         """检测帧中的人形。
