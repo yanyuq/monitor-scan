@@ -1,31 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import os
+import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 APP_NAME = "monitor-scan"
+MACOS_APP_NAME = "监控视频智能分析系统"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIRECTORY = REPO_ROOT / "models"
-YOLO_SOURCE_MODEL_PATH = MODEL_DIRECTORY / "yolo26n.pt"
-YOLO_COREML_MODEL_PATH = MODEL_DIRECTORY / "yolo26n.mlpackage"
-COREML_EXPORT_SCRIPT = REPO_ROOT / "scripts" / "export_coreml_model.py"
+YOLO_COREML_MODEL_PATH = MODEL_DIRECTORY / "yolo26n-512-fp16-nms.mlpackage"
+SUPPORTED_TARGETS = frozenset({"macos-arm64", "local"})
+EXCLUDED_RUNTIME_MODULES = ("onnx" + "runtime", "ultra" + "lytics", "tor" + "ch", "tor" + "ch" + "vision")
 
 
 def main() -> int:
     _configure_standard_streams()
-    parser = argparse.ArgumentParser(description="构建监控视频智能分析系统运行包")
-    parser.add_argument("--target", required=True, help="运行包目标平台标识，例如 windows-x86_64")
+    parser = argparse.ArgumentParser(description="构建监控视频智能分析系统 macOS Apple Silicon 运行包")
+    parser.add_argument("--target", required=True, choices=sorted(SUPPORTED_TARGETS), help="运行包目标平台标识")
     args = parser.parse_args()
 
-    model_path = _model_path_for_target(args.target)
-    if _target_uses_coreml(args.target):
-        _ensure_coreml_model()
-    if not model_path.exists():
-        raise SystemExit(f"缺少模型文件，无法打包：{model_path}")
+    _validate_macos_apple_silicon_build()
+    if not YOLO_COREML_MODEL_PATH.exists():
+        raise SystemExit(f"缺少 CoreML 模型文件，无法打包：{YOLO_COREML_MODEL_PATH}")
 
     _remove(REPO_ROOT / "build")
     _remove(REPO_ROOT / "dist")
@@ -33,7 +32,6 @@ def main() -> int:
     _remove(release_dir)
     release_dir.mkdir(parents=True, exist_ok=True)
 
-    separator = ";" if os.name == "nt" else ":"
     command = [
         sys.executable,
         "-m",
@@ -42,89 +40,60 @@ def main() -> int:
         "--clean",
         "--windowed",
         "--name",
-        APP_NAME,
+        MACOS_APP_NAME,
         "--paths",
         str(REPO_ROOT / "src"),
         "--add-data",
-        f"{model_path}{separator}{_model_data_destination(model_path)}",
-        "--collect-all",
-        "onnxruntime",
+        f"{YOLO_COREML_MODEL_PATH}:models/{YOLO_COREML_MODEL_PATH.name}",
         "--collect-all",
         "cv2",
         "--collect-all",
         "imageio_ffmpeg",
         "--collect-all",
-        "ultralytics",
-        "--collect-all",
-        "torch",
-        "--collect-all",
-        "torchvision",
+        "coremltools",
         "--collect-submodules",
         "PyQt6",
+        "--osx-bundle-identifier",
+        "com.yanyuq.monitor-scan",
+        "--codesign-identity",
+        "-",
+        "--target-architecture",
+        "arm64",
         str(REPO_ROOT / "src" / "monitor_scan" / "__main__.py"),
     ]
-    if sys.platform == "darwin":
-        command.extend(["--collect-all", "coremltools"])
-        command[command.index("--name") : command.index("--name") + 2] = ["--name", "监控视频智能分析系统"]
-        command.extend(["--osx-bundle-identifier", "com.yanyuq.monitor-scan"])
-        command.extend(["--codesign-identity", "-"])
-        target_arch = _macos_target_arch(args.target)
-        if target_arch is not None:
-            command.extend(["--target-architecture", target_arch])
+
+    for module in EXCLUDED_RUNTIME_MODULES:
+        command.extend(["--exclude-module", module])
 
     subprocess.run(command, cwd=REPO_ROOT, check=True)
 
-    package_root = release_dir / f"{APP_NAME}-{args.target}"
+    package_root = release_dir / f"{APP_NAME}-{_package_target(args.target)}"
     package_root.mkdir(parents=True, exist_ok=True)
     _copy_dist_outputs(package_root)
     _copy_if_exists(REPO_ROOT / "README.md", package_root / "README.md")
-    if sys.platform == "darwin":
-        _sign_macos_apps(package_root)
-        _write_macos_launcher(package_root)
+    _sign_macos_apps(package_root)
+    _write_macos_launcher(package_root)
 
-    archive_base = release_dir / f"{APP_NAME}-{args.target}"
-    if args.target.startswith("windows"):
-        archive = shutil.make_archive(str(archive_base), "zip", release_dir, package_root.name)
-    else:
-        archive = shutil.make_archive(str(archive_base), "gztar", release_dir, package_root.name)
+    archive_base = release_dir / package_root.name
+    archive = shutil.make_archive(str(archive_base), "gztar", release_dir, package_root.name)
 
     print(f"已生成运行包：{archive}")
     return 0
 
 
-def _model_path_for_target(target: str) -> Path:
-    if _target_uses_coreml(target):
-        return YOLO_COREML_MODEL_PATH
-    return YOLO_SOURCE_MODEL_PATH
+def _validate_macos_apple_silicon_build() -> None:
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        raise SystemExit("仅支持在 macOS Apple Silicon arm64 环境构建运行包。")
+
+
+def _package_target(target: str) -> str:
+    return "macos-arm64" if target == "local" else target
 
 
 def _model_data_destination(model_path: Path) -> str:
     if model_path.is_dir():
         return f"models/{model_path.name}"
     return "models"
-
-
-def _target_uses_coreml(target: str) -> bool:
-    return target.startswith("macos-") or (target == "local" and sys.platform == "darwin")
-
-
-def _ensure_coreml_model() -> None:
-    if not YOLO_SOURCE_MODEL_PATH.exists():
-        raise SystemExit(f"缺少 yolo26n 源模型，无法导出 CoreML：{YOLO_SOURCE_MODEL_PATH}")
-    if YOLO_COREML_MODEL_PATH.exists() and YOLO_COREML_MODEL_PATH.stat().st_mtime >= YOLO_SOURCE_MODEL_PATH.stat().st_mtime:
-        return
-    subprocess.run(
-        [
-            sys.executable,
-            str(COREML_EXPORT_SCRIPT),
-            "--source",
-            str(YOLO_SOURCE_MODEL_PATH),
-            "--output",
-            str(YOLO_COREML_MODEL_PATH),
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-    )
 
 
 def _configure_standard_streams() -> None:
@@ -136,7 +105,7 @@ def _configure_standard_streams() -> None:
 
 def _copy_dist_outputs(package_root: Path) -> None:
     dist_dir = REPO_ROOT / "dist"
-    outputs = [path for path in dist_dir.iterdir() if path.name.startswith(APP_NAME) or path.name.startswith("监控视频智能分析系统")]
+    outputs = [path for path in dist_dir.iterdir() if path.name.startswith(APP_NAME) or path.name.startswith(MACOS_APP_NAME)]
     if not outputs:
         raise SystemExit("PyInstaller 未生成可打包产物。")
 
@@ -153,15 +122,6 @@ def _copy_if_exists(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
-def _macos_target_arch(target: str) -> str | None:
-    if not target.startswith("macos-"):
-        return None
-    arch = target.removeprefix("macos-")
-    if arch != "arm64":
-        raise SystemExit(f"不支持的 macOS 架构：{arch}")
-    return arch
-
-
 def _sign_macos_apps(package_root: Path) -> None:
     for app in package_root.glob("*.app"):
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
@@ -172,7 +132,7 @@ def _write_macos_launcher(package_root: Path) -> None:
     launcher.write_text(
         "#!/bin/sh\n"
         "DIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
-        "APP=\"$DIR/监控视频智能分析系统.app\"\n"
+        f"APP=\"$DIR/{MACOS_APP_NAME}.app\"\n"
         "xattr -dr com.apple.quarantine \"$APP\" 2>/dev/null || true\n"
         "open \"$APP\"\n",
         encoding="utf-8",

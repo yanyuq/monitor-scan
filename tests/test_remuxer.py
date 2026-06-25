@@ -75,6 +75,7 @@ def test_prepare_returns_temporary_remuxed_file_and_cleanup(tmp_path):
     assert prepared.message == "FFmpeg 已完成无重编码索引重建。"
     assert captured["command"][0] == "/usr/bin/ffmpeg"
     assert captured["kwargs"]["timeout"] == 7
+    assert "creationflags" not in captured["kwargs"]
 
     prepared.cleanup()
 

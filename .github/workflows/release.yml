@@ -8,24 +8,8 @@ permissions:
 
 jobs:
   build:
-    name: 构建 ${{ matrix.label }} 运行包
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Windows x86_64
-            os: windows-latest
-            target: windows-x86_64
-            python-architecture: x64
-          - label: Linux x86_64
-            os: ubuntu-latest
-            target: linux-x86_64
-            python-architecture: x64
-          - label: macOS Apple Silicon
-            os: macos-14
-            target: macos-arm64
-            python-architecture: arm64
+    name: 构建 macOS Apple Silicon 运行包
+    runs-on: macos-14
 
     steps:
       - name: 检出代码
@@ -37,13 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          architecture: ${{ matrix.python-architecture }}
-
-      - name: 安装 Linux 图形运行库
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+          architecture: arm64
 
       - name: 安装 Python 依赖
         run: |
@@ -54,15 +32,13 @@ jobs:
         run: python -m pytest
 
       - name: 构建运行包
-        run: python scripts/build_package.py --target "${{ matrix.target }}"
+        run: python scripts/build_package.py --target macos-arm64
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: monitor-scan-${{ matrix.target }}
-          path: |
-            release/*.zip
-            release/*.tar.gz
+          name: monitor-scan-macos-arm64
+          path: release/*.tar.gz
           if-no-files-found: error
 
   release:
@@ -70,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - name: 下载全部运行包
+      - name: 下载运行包
         uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -86,8 +62,6 @@ jobs:
           自动打包发布版本：${VERSION}
 
           包含运行包：
-          - Windows x86_64
-          - Linux x86_64
           - macOS Apple Silicon arm64
 
           说明：同一天重复手动触发时，会覆盖同名运行包。
@@ -99,4 +73,4 @@ jobs:
             gh release create "${VERSION}" --title "${VERSION}" --notes-file "${NOTES_FILE}"
           fi
 
-          find release-assets -type f \( -name 'monitor-scan-*.zip' -o -name 'monitor-scan-*.tar.gz' \) -print0 | xargs -0 -r gh release upload "${VERSION}" --clobber
+          find release-assets -type f -name 'monitor-scan-*.tar.gz' -print0 | xargs -0 -r gh release upload "${VERSION}" --clobber

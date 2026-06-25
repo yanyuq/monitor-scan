@@ -1,27 +1,37 @@
 # 监控视频智能分析系统
 
-这是一个跨平台桌面工具，用于批量分析监控视频中的人形事件。程序会先用 OpenCV 做画面运动检测，只有画面发生明显变化时才调用 yolo26n 模型进行人形识别，从而减少长视频分析时的计算量。macOS 端优先使用 CoreML `.mlpackage` 模型，以利用 Apple 芯片的专用推理能力。
+这是一个面向 macOS Apple Silicon，尤其是 MacBook M1 的监控视频人形事件分析工具。程序使用 PyQt6 提供桌面界面，使用 OpenCV 读取视频和做运动检测，并固定加载 CoreML `mlpackage` 模型，通过 `CPU_AND_NE` 让 CoreML 优先使用 Apple Neural Engine。
 
 ## 功能特性
 
-- 支持选择视频目录并批量扫描常见视频格式。
-- 支持 `.mp4`、`.avi`、`.mkv`、`.mov`、`.wmv`、`.flv`。
+- 支持选择视频目录并批量扫描常见视频格式：`.mp4`、`.avi`、`.mkv`、`.mov`、`.wmv`、`.flv`。
 - 使用流式读取处理长视频，避免一次性把视频载入内存。
 - 默认先用 FFmpeg 无重编码重封装视频，重建索引并纠正时间戳。
-- 支持抽帧频率和 AI 置信度阈值配置。
-- 使用 OpenCV 运动检测作为前置过滤。
-- 使用 yolo26n 模型识别人形，macOS 端优先加载 CoreML 模型。
-- 检测到人形后自动保存带红框截图。
-- 自动生成 CSV 检测报告。
-- 使用 PyQt6 图形界面，后台线程分析视频，避免界面卡死。
+- 使用降采样 OpenCV 运动检测作为前置过滤，减少空场景 YOLO 调用。
+- 固定使用 yolo26n CoreML 模型识别人形。
+- 检测到人形后自动保存带红框截图，并生成 CSV 检测报告。
+- 支持调整抽帧频率和 AI 置信度阈值。
+
+## 运行环境
+
+- macOS Apple Silicon arm64。
+- 推荐 MacBook Air M1 16G 或更高配置。
+- Python 3.12。
+- 运行时模型固定为 `models/yolo26n-512-fp16-nms.mlpackage`。
+
+本项目当前不再支持 Windows、Linux、ONNX Runtime 或 Ultralytics `.pt` 运行时推理。
 
 ## 目录结构
 
 ```text
 monitor-scan/
 ├── models/
-│   ├── yolo26n.pt
-│   └── yolo26n.mlpackage
+│   └── yolo26n-512-fp16-nms.mlpackage/
+├── scripts/
+│   ├── build_package.py
+│   ├── benchmark_detector.py
+│   ├── benchmark_video.py
+│   └── export_coreml_model.py
 ├── src/monitor_scan/
 │   ├── ai/
 │   ├── gui/
@@ -29,32 +39,20 @@ monitor-scan/
 │   ├── video/
 │   └── workers/
 ├── tests/
-├── scripts/build_package.py
-├── .github/workflows/release.yml
 └── pyproject.toml
 ```
 
 ## 模型文件
 
-程序默认使用以下模型文件：
+运行和打包前必须存在以下 CoreML 模型目录：
 
 ```text
-models/yolo26n.pt
+models/yolo26n-512-fp16-nms.mlpackage
 ```
 
-macOS 端如果存在以下 CoreML 模型，会优先加载它：
-
-```text
-models/yolo26n.mlpackage
-```
-
-本项目不会在运行时自动下载模型。运行或打包前，请确认 `models/yolo26n.pt` 已经存在。macOS 打包时会在缺少或过期时尝试从 `models/yolo26n.pt` 导出 `models/yolo26n.mlpackage`。
-
-如果是通过 GitHub Actions 打包发布，也需要确保 `models/yolo26n.pt` 已经提交到仓库，或通过 Git LFS 管理并能在 workflow 中正常拉取。
+程序不会在运行时自动下载模型，也不会从 `.pt` 自动导出模型。若缺少该目录，GUI 会提示模型文件缺失，打包脚本会直接终止。
 
 ## 本地开发环境
-
-建议使用 Python 3.12。
 
 安装依赖：
 
@@ -82,7 +80,7 @@ python -m monitor_scan
 
 ## 使用流程
 
-1. 准备模型文件：确认 `models/yolo26n.pt` 存在；macOS 可先执行 `python scripts/export_coreml_model.py` 生成 `models/yolo26n.mlpackage`。
+1. 确认 `models/yolo26n-512-fp16-nms.mlpackage` 存在。
 2. 启动程序。
 3. 点击“选择文件夹”，选择包含监控视频的目录。
 4. 根据需要调整“抽帧频率”和“AI 灵敏度”。
@@ -118,7 +116,7 @@ CSV 字段包括：
 ffmpeg -c:v copy
 ```
 
-该步骤不会重新压缩视频，只会重建索引、生成时间戳并丢弃明显损坏的数据包。OpenCV 随后读取生成的隐藏临时文件，报告和截图仍使用原视频文件名；分析结束后临时目录会自动删除。
+该步骤不会重新压缩视频，只会重建索引、生成时间戳并丢弃明显损坏的数据包。OpenCV 随后读取生成的临时文件，报告和截图仍使用原视频文件名；分析结束后临时目录会自动删除。
 
 如果系统没有安装 FFmpeg，程序会优先使用 `imageio-ffmpeg` 提供的内置 FFmpeg。若 FFmpeg 不可用、重封装失败或超时，程序会自动回退为直接分析原视频。
 
@@ -132,44 +130,34 @@ no frame!
 
 这些警告表示视频局部码流损坏。自动重封装可以减少卡帧、提前结束和时间戳错乱导致的漏检，但无法恢复原始文件中已经缺失或无法解码的画面数据。
 
-## 手动打包发布
+## 性能基准
 
-项目提供 GitHub Actions workflow：
+检测器基准：
 
-```text
-.github/workflows/release.yml
+```bash
+python scripts/benchmark_detector.py --iterations 5 --warmup 1
 ```
 
-该 workflow 只能手动触发。触发后会：
+视频端到端基准：
 
-1. 在 Windows x86_64、Linux x86_64、macOS Apple Silicon 三个目标分别安装依赖。
-2. 执行本地测试。
-3. 使用 PyInstaller 打包运行包。
-4. 创建当前日期版本号的 GitHub Release，例如 `v20260525`。
-5. 上传三个平台的运行包到 Release。
-
-打包产物命名示例：
-
-```text
-monitor-scan-windows-x86_64.zip
-monitor-scan-linux-x86_64.tar.gz
-monitor-scan-macos-arm64.tar.gz
+```bash
+python scripts/benchmark_video.py --video /path/to/sample.mp4
 ```
 
-同一天重复触发 workflow 时，会更新同名 Release，并覆盖同名运行包。
+输出会包含模型路径、CoreML backend、`CPU_AND_NE`、推理耗时、YOLO 调用次数和进程峰值内存。
 
 ## 本地打包
 
-如需本地打包，可以安装构建依赖：
+安装构建依赖：
 
 ```bash
 python -m pip install -e ".[build]"
 ```
 
-然后执行：
+在 macOS Apple Silicon 环境执行：
 
 ```bash
-python scripts/build_package.py --target local
+python scripts/build_package.py --target macos-arm64
 ```
 
 生成的运行包会位于：
@@ -178,10 +166,36 @@ python scripts/build_package.py --target local
 release/
 ```
 
+macOS 运行包内包含 `启动.command`，用于移除解压后可能携带的隔离属性并启动应用。
+
+## 手动发布
+
+GitHub Actions workflow 位于：
+
+```text
+.github/workflows/release.yml
+```
+
+该 workflow 只能手动触发，会在 macOS Apple Silicon runner 上执行测试、打包并上传 `monitor-scan-macos-arm64.tar.gz` 到日期版本 Release。
+
+## 开发者重新导出 CoreML 模型
+
+导出脚本作为开发工具保留，不属于运行时依赖。需要重新从外部 `.pt` 源模型导出时，先安装导出依赖：
+
+```bash
+python -m pip install -e ".[export]"
+```
+
+然后执行：
+
+```bash
+python scripts/export_coreml_model.py --source /path/to/yolo26n.pt --output models/yolo26n-512-fp16-nms.mlpackage --imgsz 512 --half --nms
+```
+
+导出的模型需要保持 `512×512` 图像输入，并输出 `1×300×6` 的 `x1, y1, x2, y2, confidence, class_id` 结果格式。
+
 ## 注意事项
 
-- Windows 和 Linux 的 workflow 构建目标为 x86_64，不是 32 位 x86。
-- macOS workflow 使用 `macos-14` runner，目标为 Apple Silicon arm64。
-- macOS 运行包内包含 `启动.command`，用于移除解压后可能携带的隔离属性并启动应用。
-- 打包前必须存在 `models/yolo26n.pt`；macOS 运行包会优先包含 `models/yolo26n.mlpackage`。
+- CoreML 没有 `NE_ONLY` 选项，当前固定使用 `CPU_AND_NE`，这是 Apple Neural Engine 优先且禁用 GPU 的可用运行方式。
+- 视频解码、图像缩放、颜色转换、运动检测、截图和 CSV 写入仍会使用 CPU。
 - 真实识别效果取决于模型质量、视频清晰度、抽帧频率和置信度阈值。

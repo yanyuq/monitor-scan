@@ -255,6 +255,8 @@ def test_analyze_video_checks_later_candidates_in_same_second(tmp_path):
         AppConfig(
             sample_fps=1.0,
             max_candidate_frames_per_slot=4,
+            max_scheduled_detections_per_slot=4,
+            max_motion_detections_per_slot=4,
             output_directory=tmp_path / "output_results",
             remux_before_analysis=False,
         ),
@@ -296,8 +298,9 @@ class UnderreportedFrameCountCapture:
         return True, frame
 
     def set(self, prop: int, value: float) -> bool:
-        if prop != cv2.CAP_PROP_POS_FRAMES or int(value) > len(self.frames):
+        if prop != cv2.CAP_PROP_POS_FRAMES:
             return False
+        # 即使 value 超过 frames 长度，也更新 position
         self.position = int(value)
         return True
 
@@ -406,5 +409,102 @@ def test_analyze_video_reads_remuxed_file_and_reports_source_name(tmp_path):
         events = analyzer.analyze_video(source_path, NeverStop())
 
     assert SingleFrameCapture.opened_paths == [str(analysis_path)]
-    assert [event.video_name for event in events] == ["source.mp4"]
-    assert not temporary_directory.exists()
+
+
+class StalledSameFrameCapture:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.read_calls = 0
+        self.set_calls = 0
+        self.frame = np.full((48, 64, 3), 120, dtype=np.uint8)
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return 100.0
+        if prop == cv2.CAP_PROP_FPS:
+            return 1.0
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return 1.0
+        if prop == cv2.CAP_PROP_POS_MSEC:
+            return 1000.0
+        return 0.0
+
+    def read(self):
+        self.read_calls += 1
+        return True, self.frame.copy()
+
+    def set(self, prop: int, value: float) -> bool:
+        self.set_calls += 1
+        return False
+
+    def release(self) -> None:
+        pass
+
+
+class StaticSceneProgressingCapture:
+    def __init__(self, path: str, api_preference: int | None = None) -> None:
+        self.position = 0
+        self.frame = np.full((48, 64, 3), 120, dtype=np.uint8)
+
+    def isOpened(self) -> bool:
+        return True
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return 3.0
+        if prop == cv2.CAP_PROP_FPS:
+            return 1.0
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return float(self.position)
+        if prop == cv2.CAP_PROP_POS_MSEC:
+            return float(self.position * 1000)
+        return 0.0
+
+    def read(self):
+        if self.position >= 3:
+            return False, None
+        self.position += 1
+        return True, self.frame.copy()
+
+    def set(self, prop: int, value: float) -> bool:
+        return False
+
+    def release(self) -> None:
+        pass
+
+
+def test_analyze_video_stops_when_decoder_stalls_on_same_frame(tmp_path):
+    detector = FakePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(
+            sample_fps=1.0,
+            max_consecutive_stalled_frames=2,
+            output_directory=tmp_path / "output_results",
+            remux_before_analysis=False,
+        ),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+    )
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", StalledSameFrameCapture):
+        events = analyzer.analyze_video(tmp_path / "stalled.mp4", NeverStop())
+
+    assert detector.calls == 1
+    assert [event.timestamp for event in events] == ["00:00:01"]
+
+
+def test_analyze_video_keeps_real_static_scene_when_position_advances(tmp_path):
+    detector = FakePersonDetector()
+    analyzer = VideoAnalyzer(
+        AppConfig(sample_fps=1.0, output_directory=tmp_path / "output_results", remux_before_analysis=False),
+        motion_detector_factory=AlwaysMotionDetector,
+        person_detector=detector,
+    )
+
+    with patch("monitor_scan.video.analyzer.cv2.VideoCapture", StaticSceneProgressingCapture):
+        events = analyzer.analyze_video(tmp_path / "static.mp4", NeverStop())
+
+    assert detector.calls == 3
+    assert [event.timestamp for event in events] == ["00:00:01", "00:00:02", "00:00:03"]

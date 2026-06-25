@@ -35,85 +35,66 @@ def test_configure_standard_streams_uses_utf8(monkeypatch):
     assert stderr.reconfigure_calls == [{"encoding": "utf-8"}]
 
 
-def test_macos_target_arch_accepts_supported_targets():
-    assert build_package._macos_target_arch("macos-arm64") == "arm64"
-    assert build_package._macos_target_arch("linux-x86_64") is None
-
-
-def test_macos_target_arch_rejects_unknown_arch():
-    with pytest.raises(SystemExit, match="不支持的 macOS 架构"):
-        build_package._macos_target_arch("macos-x86_64")
-
-
-def test_model_path_for_target_uses_coreml_for_macos(monkeypatch):
-    monkeypatch.setattr(build_package.sys, "platform", "linux")
-    assert build_package._model_path_for_target("macos-arm64") == build_package.YOLO_COREML_MODEL_PATH
-
-
-def test_model_path_for_target_uses_coreml_for_local_on_macos(monkeypatch):
+def test_validate_macos_apple_silicon_build_accepts_arm64_macos(monkeypatch):
     monkeypatch.setattr(build_package.sys, "platform", "darwin")
-    assert build_package._model_path_for_target("local") == build_package.YOLO_COREML_MODEL_PATH
+    monkeypatch.setattr(build_package.platform, "machine", lambda: "arm64")
+
+    build_package._validate_macos_apple_silicon_build()
 
 
-def test_model_path_for_target_uses_pt_for_non_macos(monkeypatch):
+def test_validate_macos_apple_silicon_build_rejects_other_platform(monkeypatch):
     monkeypatch.setattr(build_package.sys, "platform", "linux")
-    assert build_package._model_path_for_target("linux-x86_64") == build_package.YOLO_SOURCE_MODEL_PATH
-    assert build_package._model_path_for_target("local") == build_package.YOLO_SOURCE_MODEL_PATH
+    monkeypatch.setattr(build_package.platform, "machine", lambda: "x86_64")
+
+    with pytest.raises(SystemExit, match="仅支持在 macOS Apple Silicon arm64 环境构建运行包"):
+        build_package._validate_macos_apple_silicon_build()
+
+
+def test_package_target_normalizes_local_to_macos_arm64():
+    assert build_package._package_target("local") == "macos-arm64"
+    assert build_package._package_target("macos-arm64") == "macos-arm64"
 
 
 def test_model_data_destination_preserves_mlpackage_directory(tmp_path):
-    coreml_model = tmp_path / "yolo26n.mlpackage"
-    pt_model = tmp_path / "yolo26n.pt"
+    coreml_model = tmp_path / "yolo26n-512-fp16-nms.mlpackage"
     coreml_model.mkdir()
-    pt_model.write_text("model", encoding="utf-8")
 
-    assert build_package._model_data_destination(coreml_model) == "models/yolo26n.mlpackage"
-    assert build_package._model_data_destination(pt_model) == "models"
+    assert build_package._model_data_destination(coreml_model) == "models/yolo26n-512-fp16-nms.mlpackage"
 
 
-def test_ensure_coreml_model_runs_export_when_missing(tmp_path, monkeypatch):
-    source = tmp_path / "models" / "yolo26n.pt"
-    output = tmp_path / "models" / "yolo26n.mlpackage"
-    export_script = tmp_path / "scripts" / "export_coreml_model.py"
-    source.parent.mkdir(parents=True)
-    export_script.parent.mkdir(parents=True)
-    source.write_text("model", encoding="utf-8")
+def test_main_builds_macos_coreml_only_pyinstaller_command(tmp_path, monkeypatch):
+    model_path = tmp_path / "models" / "yolo26n-512-fp16-nms.mlpackage"
+    model_path.mkdir(parents=True)
     calls = []
-    monkeypatch.setattr(build_package, "YOLO_SOURCE_MODEL_PATH", source)
-    monkeypatch.setattr(build_package, "YOLO_COREML_MODEL_PATH", output)
-    monkeypatch.setattr(build_package, "COREML_EXPORT_SCRIPT", export_script)
+    monkeypatch.setattr(build_package.sys, "argv", ["build_package.py", "--target", "macos-arm64"])
+    monkeypatch.setattr(build_package.sys, "platform", "darwin")
+    monkeypatch.setattr(build_package.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(build_package, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(build_package, "YOLO_COREML_MODEL_PATH", model_path)
+    monkeypatch.setattr(build_package, "_remove", lambda path: None)
+    monkeypatch.setattr(build_package, "_copy_dist_outputs", lambda package_root: None)
+    monkeypatch.setattr(build_package, "_copy_if_exists", lambda source, target: None)
+    monkeypatch.setattr(build_package, "_sign_macos_apps", lambda package_root: None)
+    monkeypatch.setattr(build_package, "_write_macos_launcher", lambda package_root: None)
     monkeypatch.setattr(build_package.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(build_package.shutil, "make_archive", lambda *args, **kwargs: str(tmp_path / "release.tar.gz"))
 
-    build_package._ensure_coreml_model()
+    build_package.main()
 
     assert len(calls) == 1
     command = calls[0][0][0]
-    assert command[:2] == [build_package.sys.executable, str(export_script)]
-    assert "--source" in command
-    assert str(source) in command
-    assert "--output" in command
-    assert str(output) in command
-    assert calls[0][1]["cwd"] == build_package.REPO_ROOT
+    assert command[:3] == [build_package.sys.executable, "-m", "PyInstaller"]
+    assert "--add-data" in command
+    assert f"{model_path}:models/yolo26n-512-fp16-nms.mlpackage" in command
+    assert "--target-architecture" in command
+    assert command[command.index("--target-architecture") + 1] == "arm64"
+    removed_packages = ("onnx" + "runtime", "ultra" + "lytics", "tor" + "ch", "tor" + "ch" + "vision")
+    for package in removed_packages:
+        assert package not in command[command.index("--collect-all") : command.index("--exclude-module")]
+        assert package in command
+    assert "coremltools" in command
+    assert calls[0][1]["cwd"] == tmp_path
     assert calls[0][1]["check"] is True
-
-
-def test_ensure_coreml_model_skips_current_output(tmp_path, monkeypatch):
-    source = tmp_path / "models" / "yolo26n.pt"
-    output = tmp_path / "models" / "yolo26n.mlpackage"
-    source.parent.mkdir(parents=True)
-    source.write_text("model", encoding="utf-8")
-    output.mkdir()
-    os.utime(source, (1, 1))
-    os.utime(output, (2, 2))
-    monkeypatch.setattr(build_package, "YOLO_SOURCE_MODEL_PATH", source)
-    monkeypatch.setattr(build_package, "YOLO_COREML_MODEL_PATH", output)
-    monkeypatch.setattr(
-        build_package.subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("CoreML 模型未过期时不应重新导出"),
-    )
-
-    build_package._ensure_coreml_model()
 
 
 def test_write_macos_launcher_creates_executable_command(tmp_path):
