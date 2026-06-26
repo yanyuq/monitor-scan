@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -443,5 +446,29 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait(3000)
+            if not self._thread.wait(5000):
+                # 线程未在 5 秒内退出，强制终止
+                logger.warning("工作线程未响应，强制终止")
+                self._thread.terminate()
+                self._thread.wait(2000)
+        # 清理残留的 FFmpeg 子进程
+        self._kill_orphan_ffmpeg()
         event.accept()
+
+    @staticmethod
+    def _kill_orphan_ffmpeg() -> None:
+        """清理残留的 FFmpeg 子进程。"""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "ffmpeg.*pipe:1|ffmpeg.*crop="],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            for line in result.stdout.strip().splitlines():
+                pid = int(line.strip())
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    logger.info(f"已清理残留 FFmpeg 进程：pid={pid}")
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+        except Exception as exc:
+            logger.debug(f"清理残留 FFmpeg 进程时出错：{exc}")

@@ -382,7 +382,7 @@ class FakeRemuxer:
         self.temporary_directory = temporary_directory
         self.analysis_path = analysis_path
 
-    def prepare(self, video_path: str | Path, roi=None) -> PreparedVideo:
+    def prepare(self, video_path: str | Path) -> PreparedVideo:
         self.temporary_directory.mkdir()
         self.analysis_path.write_bytes(b"video")
         return PreparedVideo(

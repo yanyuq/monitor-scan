@@ -279,5 +279,3 @@ class AppConfig:
                 raise ValueError("ROI 的 x 和 y 坐标不能为负数。")
             if self.roi_width <= 0 or self.roi_height <= 0:
                 raise ValueError("ROI 的宽度和高度必须大于 0。")
-            if self.roi_width % 2 != 0 or self.roi_height % 2 != 0:
-                raise ValueError("ROI 的宽度和高度必须为偶数（FFmpeg 编码要求）。")

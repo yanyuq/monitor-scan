@@ -95,6 +95,9 @@ class MotionDetector:
     def has_motion(self, frame: np.ndarray) -> bool:
         """检测帧中是否有运动。
 
+        使用 UMat (OpenCL) 将形态学操作卸载到 GPU，降低 CPU 负载。
+        MOG2 背景减除和最终的 countNonZero 仍在 CPU 上执行。
+
         Args:
             frame: 输入图像帧
 
@@ -106,19 +109,19 @@ class MotionDetector:
         motion_frame = self._resize_frame(frame)
         mask = self._subtractor.apply(motion_frame)
 
-        # 二值化处理
+        # 二值化处理（CPU，输入输出都小）
         _, thresholded = cv2.threshold(mask, DEFAULT_THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
 
-        # 形态学操作：去噪和填充
+        # 形态学操作：使用 UMat 卸载到 GPU
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_OPEN, kernel)
-        thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, kernel)
+        u_mat = cv2.UMat(thresholded)
+        u_mat = cv2.morphologyEx(u_mat, cv2.MORPH_OPEN, kernel)
+        u_mat = cv2.morphologyEx(u_mat, cv2.MORPH_CLOSE, kernel)
+        u_mat = cv2.dilate(u_mat, kernel, iterations=MOTION_DILATE_ITERATIONS)
+        u_mat = cv2.medianBlur(u_mat, DEFAULT_MEDIAN_BLUR_SIZE)
 
-        # 膨胀操作：连接相邻区域
-        thresholded = cv2.dilate(thresholded, kernel, iterations=MOTION_DILATE_ITERATIONS)
-
-        # 中值滤波去噪
-        thresholded = cv2.medianBlur(thresholded, DEFAULT_MEDIAN_BLUR_SIZE)
+        # 转回 CPU 计算运动面积
+        thresholded = u_mat.get()
 
         # 计算运动区域面积
         moving_area = cv2.countNonZero(thresholded)
@@ -149,6 +152,8 @@ class MotionDetector:
     def get_motion_regions(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         """获取运动区域。
 
+        使用 UMat (OpenCL) 将形态学操作卸载到 GPU。
+
         Args:
             frame: 输入图像帧
 
@@ -161,11 +166,13 @@ class MotionDetector:
         # 二值化处理
         _, thresholded = cv2.threshold(mask, DEFAULT_THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
 
-        # 形态学操作
+        # 形态学操作：使用 UMat 卸载到 GPU
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_OPEN, kernel)
-        thresholded = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, kernel)
-        thresholded = cv2.dilate(thresholded, kernel, iterations=MOTION_DILATE_ITERATIONS)
+        u_mat = cv2.UMat(thresholded)
+        u_mat = cv2.morphologyEx(u_mat, cv2.MORPH_OPEN, kernel)
+        u_mat = cv2.morphologyEx(u_mat, cv2.MORPH_CLOSE, kernel)
+        u_mat = cv2.dilate(u_mat, kernel, iterations=MOTION_DILATE_ITERATIONS)
+        thresholded = u_mat.get()
 
         # 查找轮廓
         contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -189,6 +196,8 @@ class MotionDetector:
 
     def get_motion_intensity(self, frame: np.ndarray) -> float:
         """获取运动强度。
+
+        使用 UMat (OpenCL) 将二值化操作卸载到 GPU。
 
         Args:
             frame: 输入图像帧

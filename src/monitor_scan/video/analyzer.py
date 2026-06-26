@@ -9,11 +9,15 @@
 3. 关键帧强制检测：确保 I-frame 不被遗漏
 4. 丢帧补偿策略：丢帧后保持高采样率，双向检测
 5. 滑动窗口检测：提高检测覆盖的重叠度
+6. 硬件加速解码：优先使用 FFmpeg VideoToolbox 解码（Apple Silicon）
+7. 解码-检测并行流水线：解码线程与检测线程分离
 """
 
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +30,7 @@ from monitor_scan.ai.motion import MotionDetector
 from monitor_scan.config import AppConfig, PROGRESS_MAX
 from monitor_scan.results.writer import ResultWriter, format_timestamp
 from monitor_scan.types import DetectionEvent, PersonDetection
-from monitor_scan.video.remuxer import FfmpegRemuxer, PreparedVideo
+from monitor_scan.video.remuxer import FfmpegFrameReader, FfmpegRemuxer, PreparedVideo
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +176,12 @@ class VideoAnalyzer:
     ) -> list[DetectionEvent]:
         """分析单个视频文件。
 
+        优先使用 FFmpeg VideoToolbox 硬件解码 + 并行流水线，
+        不可用时回退到 OpenCV 软解码。
+
+        当使用 FFmpeg 硬件解码且无需 ROI 裁剪时，直接读取源文件，
+        跳过不必要的临时文件拷贝，减少磁盘占用。
+
         Args:
             video_path: 视频文件路径
             stop_token: 停止令牌，用于检查是否应停止处理
@@ -187,20 +197,32 @@ class VideoAnalyzer:
         source_path = Path(video_path)
         logger.info(f"开始分析视频：{source_path}")
 
-        prepared_video = self._prepare_video(source_path)
-        capture = None
+        reader: FfmpegFrameReader | cv2.VideoCapture | None = None
+        prepared_video: PreparedVideo | None = None
 
         try:
-            capture = self._open_capture(prepared_video.analysis_path)
-            if not capture.isOpened():
-                raise OSError(f"视频无法打开：{source_path}")
+            # 先重封装：生成干净的临时文件（修复索引、丢弃损坏数据包）
+            # 这一步不解码帧，速度极快，能显著降低后续解码卡死的概率
+            prepared_video = self._prepare_video(source_path)
+            analysis_path = prepared_video.analysis_path
+
+            # 优先 FFmpeg 硬件解码（从干净文件读取，卡死时自动回退 CPU）
+            reader = self._open_ffmpeg_reader(analysis_path)
+            use_ffmpeg = reader is not None
+
+            if not use_ffmpeg:
+                # 回退到 OpenCV
+                reader = self._open_capture(analysis_path)
+                if not reader.isOpened():
+                    raise OSError(f"视频无法打开：{source_path}")
 
             events = self._analyze_capture(
-                capture,
+                reader,
                 source_path,
                 stop_token,
                 progress_callback,
                 detection_callback,
+                use_ffmpeg=use_ffmpeg,
             )
             logger.info(f"视频分析完成：{source_path}，检测到 {len(events)} 个事件")
             return events
@@ -210,26 +232,28 @@ class VideoAnalyzer:
             raise
         finally:
             # 安全释放资源
-            if capture is not None:
+            if reader is not None:
                 try:
-                    capture.release()
+                    reader.release()
                 except Exception as exc:
                     logger.warning(f"释放视频捕获对象时出错：{exc}")
 
-            try:
-                prepared_video.cleanup()
-            except Exception as exc:
-                logger.warning(f"清理临时文件时出错：{exc}")
+            if prepared_video is not None:
+                try:
+                    prepared_video.cleanup()
+                except Exception as exc:
+                    logger.warning(f"清理临时文件时出错：{exc}")
 
     def _analyze_capture(
         self,
-        capture: cv2.VideoCapture,
+        reader: FfmpegFrameReader | cv2.VideoCapture,
         source_path: Path,
         stop_token: StopToken,
         progress_callback: Callable[[VideoProgress], None] | None,
         detection_callback: Callable[[DetectionEvent], None] | None,
+        use_ffmpeg: bool = False,
     ) -> list[DetectionEvent]:
-        """分析已打开的视频捕获对象。
+        """分析已打开的视频读取器。
 
         实现了多层检测漏斗策略：
         1. 时间戳分析 - 检测丢帧
@@ -237,49 +261,110 @@ class VideoAnalyzer:
         3. 运动检测 - 过滤无运动场景
         4. YOLO 检测 - 最终人形识别
 
+        当 use_ffmpeg=True 时，使用解码-检测并行流水线：
+        解码线程将帧放入队列，检测线程从队列取帧处理。
+
         Args:
-            capture: OpenCV 视频捕获对象
+            reader: FFmpeg 帧读取器或 OpenCV 视频捕获对象
             source_path: 原始视频路径（用于报告）
             stop_token: 停止令牌
             progress_callback: 进度回调
             detection_callback: 检测事件回调
+            use_ffmpeg: 是否使用 FFmpeg 硬件解码模式
 
         Returns:
             检测到的事件列表
         """
         events: list[DetectionEvent] = []
         motion_detector = self.motion_detector_factory()
-        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_fps = capture.get(cv2.CAP_PROP_FPS) or self.config.sample_fps
 
-        logger.debug(f"视频信息：总帧数={total_frames}，FPS={video_fps}")
+        # 获取视频信息
+        if use_ffmpeg and isinstance(reader, FfmpegFrameReader):
+            total_frames = reader.total_frames
+            video_fps = reader.fps or self.config.sample_fps
+            video_duration = reader.duration  # 秒
+        else:
+            total_frames = int(reader.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_fps = reader.get(cv2.CAP_PROP_FPS) or self.config.sample_fps
+            video_duration = total_frames / video_fps if video_fps > 0 and total_frames > 0 else 0.0
+
+        logger.info(
+            f"视频信息：总帧数={total_frames}，FPS={video_fps:.1f}，"
+            f"时长={video_duration:.1f}秒，硬件解码={'是' if use_ffmpeg else '否'}"
+        )
 
         # 初始化状态
         state = FrameAnalysisState()
         state.current_sample_fps = self.config.sample_fps
-        last_progress_slot = -1
+        last_progress_value = -1
+
+        # 发送初始进度 0%
+        if progress_callback is not None:
+            progress_callback(VideoProgress(source_path, 0))
+            last_progress_value = 0
 
         # 用于双向检测的缓冲区
         pre_drop_buffer: list[tuple[float, np.ndarray]] = []
         post_drop_buffer: list[tuple[float, np.ndarray]] = []
 
+        # 并行流水线：解码队列
+        decode_queue: queue.Queue[tuple[bool, np.ndarray | None]] = queue.Queue(maxsize=3)
+        decode_thread: threading.Thread | None = None
+
+        if use_ffmpeg and isinstance(reader, FfmpegFrameReader):
+            # 启动解码线程（read() 内置超时检测和硬解→软解自动回退）
+            def _decode_worker() -> None:
+                while not stop_token.is_stopped():
+                    ok, frame = reader.read(timeout=10.0)
+                    decode_queue.put((ok, frame))
+                    if not ok:
+                        break
+
+            decode_thread = threading.Thread(target=_decode_worker, name="decode-worker", daemon=True)
+            decode_thread.start()
+            logger.debug("解码-检测并行流水线已启动")
+
         while not stop_token.is_stopped():
-            ok, frame = capture.read()
+            # 读取帧：优先从队列，回退到直接读取
+            if decode_thread is not None:
+                try:
+                    ok, frame = decode_queue.get(timeout=5.0)
+                except queue.Empty:
+                    # 解码线程是否还活着
+                    if not decode_thread.is_alive():
+                        logger.warning("解码线程已退出，停止处理")
+                        break
+                    continue
+            else:
+                ok, frame = reader.read()
+
             if not ok:
                 state.consecutive_decode_failures += 1
                 if state.consecutive_decode_failures >= self.config.max_consecutive_decode_failures:
                     logger.warning(f"连续解码失败 {state.consecutive_decode_failures} 次，停止处理")
                     break
                 # 尝试跳过失败的帧
-                # 使用 set() 尝试跳到下一帧
-                capture.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index + 1)
+                if isinstance(reader, cv2.VideoCapture):
+                    reader.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index + 1)
                 state.frame_index += 1
                 if progress_callback is not None:
-                    progress_callback(VideoProgress(source_path, self._progress(state.frame_index, total_frames)))
+                    progress_callback(VideoProgress(source_path, self._progress_by_time(
+                        state.last_frame_time, video_duration, total_frames, state.frame_index,
+                    )))
                 continue
 
+            # ROI 帧级裁剪：用 numpy 切片直接裁剪，零额外开销
+            if self.config.has_roi:
+                frame = frame[
+                    self.config.roi_y : self.config.roi_y + self.config.roi_height,
+                    self.config.roi_x : self.config.roi_x + self.config.roi_width,
+                ]
+
             # 第 1 层：时间戳分析 - 检测丢帧
-            frame_time_seconds = self._frame_time_seconds(capture, state.frame_index, video_fps)
+            if isinstance(reader, cv2.VideoCapture):
+                frame_time_seconds = self._frame_time_seconds(reader, state.frame_index, video_fps)
+            else:
+                frame_time_seconds = self._frame_time_seconds_by_index(state.frame_index, video_fps)
             drop_info = self._detect_frame_drop(frame_time_seconds, state.last_frame_time, video_fps)
 
             if drop_info.is_drop:
@@ -309,8 +394,13 @@ class VideoAnalyzer:
             current_frame_signature = self._frame_signature(frame)
 
             # 检查停滞帧
-            capture_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-            capture_msec = capture.get(cv2.CAP_PROP_POS_MSEC)
+            if isinstance(reader, cv2.VideoCapture):
+                capture_position = reader.get(cv2.CAP_PROP_POS_FRAMES)
+                capture_msec = reader.get(cv2.CAP_PROP_POS_MSEC)
+            else:
+                # FFmpeg 顺序读取，使用帧索引作为位置
+                capture_position = float(state.frame_index)
+                capture_msec = state.frame_index / video_fps * 1000 if video_fps > 0 else 0.0
 
             if self._is_stalled_frame(
                 current_frame_signature,
@@ -323,17 +413,16 @@ class VideoAnalyzer:
                 state.consecutive_stalled_frames += 1
                 if state.consecutive_stalled_frames >= self.config.max_consecutive_stalled_frames:
                     logger.debug(f"检测到连续 {state.consecutive_stalled_frames} 帧停滞，尝试跳过")
-                    # 尝试跳过失败的帧
-                    set_result = capture.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index + 1)
                     state.consecutive_stalled_frames = 0
                     state.previous_frame_signature = None
                     state.previous_capture_position = -1.0
                     state.previous_capture_msec = -1.0
                     state.frame_index += 1
-                    # 如果 set 失败，可能是视频结束
-                    if not set_result:
-                        logger.info("无法跳过停滞帧，可能是视频结束")
-                        break
+                    if isinstance(reader, cv2.VideoCapture):
+                        set_result = reader.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index + 1)
+                        if not set_result:
+                            logger.info("无法跳过停滞帧，可能是视频结束")
+                            break
                     continue
             else:
                 state.consecutive_stalled_frames = 0
@@ -357,11 +446,11 @@ class VideoAnalyzer:
                 state.scheduled_attempted_buckets.clear()
                 state.motion_attempted_buckets.clear()
 
-            # 更新进度
-            if sample_slot > last_progress_slot:
-                last_progress_slot = sample_slot
-                if progress_callback is not None:
-                    progress_callback(VideoProgress(source_path, self._progress(state.frame_index, total_frames)))
+            # 更新进度（基于视频时间，每次百分比变化时通知）
+            current_progress = self._progress_by_time(frame_time_seconds, video_duration, total_frames, state.frame_index)
+            if current_progress > last_progress_value and progress_callback is not None:
+                last_progress_value = current_progress
+                progress_callback(VideoProgress(source_path, current_progress))
 
             # 第 3 层：运动检测 - 过滤无运动场景
             has_motion = motion_detector.has_motion(frame)
@@ -410,7 +499,12 @@ class VideoAnalyzer:
 
         # 发送最终进度
         if progress_callback is not None:
-            final_progress = 100 if not stop_token.is_stopped() else self._progress(state.frame_index, total_frames)
+            if stop_token.is_stopped():
+                final_progress = self._progress_by_time(
+                    state.last_frame_time, video_duration, total_frames, state.frame_index,
+                )
+            else:
+                final_progress = PROGRESS_MAX
             progress_callback(VideoProgress(source_path, final_progress))
 
         return events
@@ -699,7 +793,9 @@ class VideoAnalyzer:
             logger.info(f"丢帧补偿检测完成，额外检测到 {redundant_count} 个事件")
 
     def _prepare_video(self, source_path: Path) -> PreparedVideo:
-        """准备视频文件，可选进行 FFmpeg 重封装和 ROI 裁剪。
+        """准备视频文件，FFmpeg 无重编码重封装（修复索引）。
+
+        ROI 裁剪在帧级别完成，不需要 FFmpeg 重编码。
 
         Args:
             source_path: 原始视频路径
@@ -711,14 +807,8 @@ class VideoAnalyzer:
             logger.debug("跳过 FFmpeg 重封装，直接分析原视频")
             return PreparedVideo(source_path=source_path, analysis_path=source_path)
 
-        # 构建 ROI 参数
-        roi: tuple[int, int, int, int] | None = None
-        if self.config.has_roi:
-            roi = (self.config.roi_x, self.config.roi_y, self.config.roi_width, self.config.roi_height)
-            logger.debug(f"启用 ROI 裁剪：{roi}")
-
         logger.debug(f"开始 FFmpeg 重封装：{source_path}")
-        return self.remuxer.prepare(source_path, roi=roi)
+        return self.remuxer.prepare(source_path)
 
     def _detect_people(self, frame: np.ndarray) -> list[PersonDetection]:
         """检测帧中的人形。
@@ -754,6 +844,50 @@ class VideoAnalyzer:
             self.config.motion_area_ratio_threshold,
             self.config.motion_detect_shadows,
         )
+
+    def _open_ffmpeg_reader(self, path: Path) -> FfmpegFrameReader | None:
+        """尝试使用 FFmpeg 硬件解码打开视频。
+
+        Args:
+            path: 视频文件路径
+
+        Returns:
+            FfmpegFrameReader 实例，失败时返回 None
+        """
+        # 快速检查：文件必须存在且大小合理
+        if not path.exists() or path.stat().st_size < 1024:
+            logger.debug("文件不存在或过小，跳过 FFmpeg 硬件解码")
+            return None
+
+        try:
+            reader = FfmpegFrameReader(
+                path,
+                ffmpeg_path=self.config.ffmpeg_path,
+                hw_accel=True,  # 优先硬件解码，卡死时自动回退 CPU
+            )
+            # 检查进程是否成功启动
+            if reader.width > 0 and reader.height > 0 and reader._process is not None:
+                return reader
+            reader.release()
+        except Exception as exc:
+            logger.debug(f"FFmpeg 硬件解码不可用，回退到 OpenCV：{exc}")
+        return None
+
+    def _frame_time_seconds_by_index(self, frame_index: int, video_fps: float) -> float:
+        """根据帧索引计算时间戳（秒）。
+
+        适用于 FFmpeg 顺序读取模式，不依赖 capture.get()。
+
+        Args:
+            frame_index: 帧索引
+            video_fps: 视频帧率
+
+        Returns:
+            时间戳（秒）
+        """
+        if video_fps > 0:
+            return frame_index / video_fps
+        return frame_index * self.config.sample_fps
 
     def _open_capture(self, path: Path) -> cv2.VideoCapture:
         """打开视频捕获对象。
@@ -908,16 +1042,29 @@ class VideoAnalyzer:
         # 这样可以处理 total_frames 报告不准确的情况
         return True
 
-    def _progress(self, frame_index: int, total_frames: int) -> int:
-        """计算进度百分比。
+    @staticmethod
+    def _progress_by_time(
+        current_time: float,
+        duration: float,
+        total_frames: int,
+        frame_index: int,
+    ) -> int:
+        """基于视频时间计算进度百分比。
+
+        优先使用时间/时长，回退到帧索引/总帧数。
 
         Args:
-            frame_index: 当前帧索引
+            current_time: 当前帧时间戳（秒）
+            duration: 视频总时长（秒）
             total_frames: 总帧数
+            frame_index: 当前帧索引
 
         Returns:
             进度百分比 (0-100)
         """
-        if total_frames <= 0:
-            return 0
-        return min(PROGRESS_MAX, int(frame_index / total_frames * PROGRESS_MAX))
+        if duration > 0:
+            return min(PROGRESS_MAX, int(current_time / duration * PROGRESS_MAX))
+        if total_frames > 0:
+            return min(PROGRESS_MAX, int(frame_index / total_frames * PROGRESS_MAX))
+        # 都不可用时，每 100 帧算 1%
+        return min(PROGRESS_MAX - 1, frame_index // 100)

@@ -1,16 +1,23 @@
-"""FFmpeg 重封装模块。
+"""FFmpeg 重封装与硬件加速模块。
 
 使用 FFmpeg 对视频进行无重编码重封装，重建索引并纠正时间戳。
+支持 VideoToolbox 硬件编解码（M1/M2 Apple Silicon）。
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import shutil
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -79,16 +86,14 @@ class FfmpegRemuxer:
     def prepare(
         self,
         video_path: str | Path,
-        roi: tuple[int, int, int, int] | None = None,
     ) -> PreparedVideo:
         """准备视频文件。
 
-        使用 FFmpeg 进行重封装，如果失败则回退到原始文件。
-        当指定 roi=(x, y, width, height) 时，使用 crop 滤镜裁剪视频。
+        使用 FFmpeg 进行无重编码重封装，修复索引和时间戳。
+        ROI 裁剪在帧级别完成，不需要 FFmpeg 重编码。
 
         Args:
             video_path: 视频文件路径
-            roi: 可选的检测区域 (x, y, width, height)，像素坐标
 
         Returns:
             准备好的视频信息
@@ -107,7 +112,7 @@ class FfmpegRemuxer:
 
         temporary_directory = self._create_temporary_directory(source_path)
         output_path = temporary_directory / f"{source_path.stem}_remuxed{source_path.suffix.lower()}"
-        command = self._build_command(executable, source_path, output_path, roi)
+        command = self._build_command(executable, source_path, output_path)
 
         logger.debug(f"执行 FFmpeg 命令：{' '.join(command)}")
 
@@ -116,6 +121,7 @@ class FfmpegRemuxer:
             "text": True,
             "timeout": self.timeout_seconds,
             "check": False,
+            "start_new_session": True,  # 独立进程组，方便清理
         }
 
         try:
@@ -136,12 +142,11 @@ class FfmpegRemuxer:
             return self._fallback(source_path, f"FFmpeg 重封装失败，已直接分析原视频：{stderr}")
 
         logger.info(f"FFmpeg 重封装成功：{output_path}")
-        roi_msg = f"（ROI 裁剪：{roi}）" if roi else ""
         return PreparedVideo(
             source_path=source_path,
             analysis_path=output_path,
             temporary_directory=temporary_directory,
-            message=f"FFmpeg 已完成索引重建{roi_msg}。",
+            message="FFmpeg 已完成索引重建。",
         )
 
     def _build_command(
@@ -149,15 +154,13 @@ class FfmpegRemuxer:
         executable: str,
         source_path: Path,
         output_path: Path,
-        roi: tuple[int, int, int, int] | None = None,
     ) -> list[str]:
-        """构建 FFmpeg 命令。
+        """构建 FFmpeg 命令（无重编码拷贝，仅修复索引）。
 
         Args:
             executable: FFmpeg 可执行文件路径
             source_path: 源视频路径
             output_path: 输出视频路径
-            roi: 可选的裁剪区域 (x, y, width, height)
 
         Returns:
             FFmpeg 命令列表
@@ -171,23 +174,10 @@ class FfmpegRemuxer:
             "-fflags", "+genpts+discardcorrupt",
             "-i", str(source_path),
             "-map", "0:v:0",
+            "-c:v", "copy",
             "-an",
             "-avoid_negative_ts", "make_zero",
         ]
-
-        if roi is not None:
-            # 裁剪模式：需要重编码
-            x, y, w, h = roi
-            command.extend([
-                "-vf", f"crop={w}:{h}:{x}:{y}",
-                "-c:v", "libx264",
-                "-crf", "23",
-                "-preset", "fast",
-            ])
-            logger.debug(f"启用 ROI 裁剪：x={x}, y={y}, width={w}, height={h}")
-        else:
-            # 无裁剪：无重编码拷贝
-            command.extend(["-c:v", "copy"])
 
         # 对于 MOV 容器添加 faststart 标志
         if output_path.suffix.lower() in MOVIE_CONTAINER_FORMATS:
@@ -275,3 +265,295 @@ class FfmpegRemuxer:
         """
         logger.info(f"回退处理：{message}")
         return PreparedVideo(source_path=source_path, analysis_path=source_path, message=message)
+
+
+class FfmpegFrameReader:
+    """基于 FFmpeg 的硬件加速帧读取器。
+
+    使用 FFmpeg 子进程解码视频，支持 VideoToolbox 硬件解码（Apple Silicon）。
+    通过 stdout pipe 输出 rawvideo（BGR24 格式），替代 OpenCV VideoCapture 的软解码。
+
+    用法::
+
+        reader = FfmpegFrameReader("/path/to/video.mp4")
+        while True:
+            ok, frame = reader.read()
+            if not ok:
+                break
+            # 处理 frame
+        reader.release()
+
+    Attributes:
+        width: 视频宽度
+        height: 视频高度
+        fps: 视频帧率
+        total_frames: 总帧数
+    """
+
+    def __init__(
+        self,
+        video_path: str | Path,
+        ffmpeg_path: str = "ffmpeg",
+        hw_accel: bool = True,
+    ) -> None:
+        """初始化帧读取器。
+
+        Args:
+            video_path: 视频文件路径
+            ffmpeg_path: FFmpeg 可执行文件路径
+            hw_accel: 是否启用硬件加速解码
+        """
+        self._video_path = Path(video_path)
+        self._ffmpeg_path = ffmpeg_path
+        self._hw_accel = hw_accel
+        self._process: subprocess.Popen | None = None
+        self.width: int = 0
+        self.height: int = 0
+        self.fps: float = 0.0
+        self.total_frames: int = 0
+        self.duration: float = 0.0  # 视频时长（秒）
+        self._frame_size: int = 0
+        self._closed: bool = True
+        self._current_frame: int = 0  # 已读取帧计数
+        self._hw_failed: bool = False  # 硬件解码是否已失败
+
+        self._probe()
+        self._start()
+
+    def _probe(self) -> None:
+        """使用 ffprobe 探测视频信息。"""
+        executable = shutil.which(self._ffmpeg_path) or self._ffmpeg_path
+        # 查找 ffprobe：优先 shutil.which，回退到替换 ffmpeg
+        ffprobe = shutil.which("ffprobe") or executable.replace("ffmpeg", "ffprobe")
+
+        # 探测流信息：宽高、帧率、帧数
+        stream_cmd = [
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+            "-of", "csv=p=0",
+            str(self._video_path),
+        ]
+        # 探测容器信息：时长
+        duration_cmd = [
+            ffprobe, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(self._video_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                stream_cmd, capture_output=True, text=True, timeout=5, check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split(",")
+                self.width = int(parts[0])
+                self.height = int(parts[1])
+                if "/" in parts[2]:
+                    num, den = parts[2].split("/")
+                    self.fps = float(num) / float(den)
+                else:
+                    self.fps = float(parts[2])
+                if len(parts) > 3 and parts[3].strip():
+                    self.total_frames = int(parts[3])
+        except (OSError, ValueError, IndexError) as exc:
+            logger.warning(f"ffprobe 流信息探测失败：{exc}")
+
+        try:
+            result = subprocess.run(
+                duration_cmd, capture_output=True, text=True, timeout=5, check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self.duration = float(result.stdout.strip())
+        except (OSError, ValueError):
+            pass
+
+        # 帧数不可用时，通过时长和帧率推算
+        if self.total_frames <= 0 and self.duration > 0 and self.fps > 0:
+            self.total_frames = int(self.duration * self.fps)
+
+        self._frame_size = self.width * self.height * 3  # BGR24
+        logger.debug(
+            f"视频信息：{self.width}x{self.height}，{self.fps:.2f}fps，"
+            f"共 {self.total_frames} 帧，时长 {self.duration:.1f}秒"
+        )
+
+    def _start(self, seek_seconds: float = 0.0) -> None:
+        """启动 FFmpeg 解码子进程。
+
+        Args:
+            seek_seconds: 跳转到指定时间位置（秒），用于断点续读
+        """
+        if self._frame_size <= 0:
+            logger.warning("视频尺寸无效，跳过 FFmpeg 解码进程启动")
+            return
+
+        executable = shutil.which(self._ffmpeg_path) or self._ffmpeg_path
+        command = [
+            executable,
+            "-hide_banner",
+            "-loglevel", "error",
+        ]
+
+        if self._hw_accel:
+            command.extend(["-hwaccel", "videotoolbox", "-hwaccel_output_format", "nv12"])
+
+        # seek 放在 -i 之前（输入 seek，更快）
+        if seek_seconds > 0:
+            command.extend(["-ss", f"{seek_seconds:.3f}"])
+
+        command.extend([
+            "-i", str(self._video_path),
+            "-map", "0:v:0",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-an",
+            "pipe:1",
+        ])
+
+        accel_mode = "VideoToolbox 硬件解码" if self._hw_accel else "CPU 软解码"
+        seek_info = f"，seek={seek_seconds:.1f}秒" if seek_seconds > 0 else ""
+        logger.info(f"启动 FFmpeg 解码进程（{accel_mode}{seek_info}）：{self._video_path}")
+
+        try:
+            # start_new_session=True：创建独立进程组，确保 release() 时能 kill 整个子进程树
+            self._process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self._frame_size * 2,  # 缓冲 2 帧
+                start_new_session=True,
+            )
+            # 短暂检查进程是否存活
+            import time
+            time.sleep(0.2)
+            if self._process.poll() is not None:
+                stderr = self._process.stderr.read().decode(errors="replace") if self._process.stderr else ""
+                logger.warning(f"FFmpeg 解码进程立即退出（{accel_mode}失败）：{stderr[:200]}")
+                self._process = None
+                return
+            logger.info(f"FFmpeg 解码进程已启动（{accel_mode}），pid={self._process.pid}")
+            self._closed = False
+        except OSError as exc:
+            logger.error(f"FFmpeg 解码进程启动失败：{exc}")
+            self._process = None
+
+    def read(self, timeout: float = 10.0) -> tuple[bool, np.ndarray | None]:
+        """读取一帧，带超时检测和硬件解码自动回退。
+
+        当 VideoToolbox 硬件解码卡死时，自动 kill 进程并用 CPU 软解码重启，
+        从当前帧位置继续读取。
+
+        Args:
+            timeout: 读取超时时间（秒）
+
+        Returns:
+            (成功标志, 帧数据)，失败时返回 (False, None)
+        """
+        if self._closed:
+            return False, None
+
+        # 进程不存在或已退出，尝试重启
+        if self._process is None or self._process.poll() is not None:
+            if self._hw_accel and not self._hw_failed:
+                return self._restart_with_cpu()
+            return False, None
+
+        import select
+
+        stdout = self._process.stdout  # type: ignore[union-attr]
+        try:
+            ready, _, _ = select.select([stdout], [], [], timeout)
+            if not ready:
+                # 超时：检查进程状态
+                if self._process.poll() is not None:
+                    logger.warning("FFmpeg 解码进程已退出")
+                    if self._hw_accel and not self._hw_failed:
+                        return self._restart_with_cpu()
+                    return False, None
+                # 进程活着但无数据输出 → VideoToolbox 卡死
+                logger.warning(f"FFmpeg read 超时 {timeout}秒，硬件解码可能卡死")
+                if self._hw_accel and not self._hw_failed:
+                    return self._restart_with_cpu()
+                return False, None
+
+            raw = stdout.read(self._frame_size)
+            if len(raw) < self._frame_size:
+                if self._hw_accel and not self._hw_failed:
+                    return self._restart_with_cpu()
+                return False, None
+
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+            self._current_frame += 1
+            return True, frame
+        except (OSError, ValueError):
+            return False, None
+
+    def _restart_with_cpu(self) -> tuple[bool, np.ndarray | None]:
+        """硬件解码卡死后，用 CPU 软解码从当前位置重启。
+
+        Returns:
+            (成功标志, 帧数据)
+        """
+        self._hw_failed = True
+        # 计算当前帧对应的时间戳，用于 seek
+        seek_seconds = self._current_frame / self.fps if self.fps > 0 else 0
+        logger.warning(
+            f"硬件解码失败，切换到 CPU 软解码（已读 {self._current_frame} 帧，"
+            f"seek 到 {seek_seconds:.1f}秒）"
+        )
+
+        # kill 当前进程
+        self._kill_process()
+
+        # 用 CPU 软解码重启
+        self._hw_accel = False
+        self._start(seek_seconds=seek_seconds)
+
+        if self._process is None:
+            logger.error("CPU 软解码重启失败")
+            return False, None
+
+        logger.info(f"CPU 软解码重启成功，从第 {self._current_frame} 帧继续")
+        # 重启后立即读取第一帧
+        return self.read(timeout=30.0)
+
+    def _kill_process(self) -> None:
+        """强制终止当前 FFmpeg 进程。"""
+        if self._process is None:
+            return
+        pid = self._process.pid
+        try:
+            self._process.stdout.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+        try:
+            self._process.wait(timeout=3)
+        except Exception:
+            pass
+        self._process = None
+        logger.debug(f"FFmpeg 进程已终止（pid={pid}）")
+
+    def release(self) -> None:
+        """释放资源，强制关闭子进程及其整个进程组。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._kill_process()
+
+    def __del__(self) -> None:
+        self.release()
+
+    def __enter__(self) -> FfmpegFrameReader:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.release()
