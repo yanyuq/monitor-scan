@@ -373,7 +373,7 @@ class FfmpegFrameReader:
         if self.total_frames <= 0 and self.duration > 0 and self.fps > 0:
             self.total_frames = int(self.duration * self.fps)
 
-        self._frame_size = self.width * self.height * 3  # BGR24
+        self._frame_size = self.width * self.height * 3 // 2  # NV12: Y + UV
         logger.debug(
             f"视频信息：{self.width}x{self.height}，{self.fps:.2f}fps，"
             f"共 {self.total_frames} 帧，时长 {self.duration:.1f}秒"
@@ -407,7 +407,7 @@ class FfmpegFrameReader:
             "-i", str(self._video_path),
             "-map", "0:v:0",
             "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
+            "-pix_fmt", "nv12",  # NV12 原生输出，省去 FFmpeg 端色彩转换
             "-an",
             "pipe:1",
         ])
@@ -484,7 +484,9 @@ class FfmpegFrameReader:
                     return self._restart_with_cpu()
                 return False, None
 
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+            # NV12 → BGR 转换（OpenCV NEON SIMD 加速，比 FFmpeg 软件转换更快）
+            nv12 = np.frombuffer(raw, dtype=np.uint8).reshape((self.height * 3 // 2, self.width))
+            frame = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
             self._current_frame += 1
             return True, frame
         except (OSError, ValueError):
