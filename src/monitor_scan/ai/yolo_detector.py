@@ -446,6 +446,10 @@ class YoloPersonDetector:
 
             detections.append(PersonDetection(box=BoundingBox(x1, y1, x2, y2), confidence=confidence))
 
+        # 只保留置信度最高的检测结果
+        if len(detections) > 1:
+            detections = [max(detections, key=lambda d: d.confidence)]
+
         return detections
 
     def get_performance_stats(self) -> dict[str, float]:
